@@ -128,7 +128,7 @@ class GaussianModel(nn.Module):
     def create_from_pcd(self, rgb, depth, c2w, camera, tool_mask=None, spatial_lr_scale : float=1.0, downsample: int=2, semantics=None):
         with torch.no_grad():
             tool_mask = torch.ones_like(depth).bool() if tool_mask is None else tool_mask
-            semantics = torch.ones((*depth.shape, self.n_classes)).squeeze(0) if semantics is None else semantics.squeeze(0)
+            semantics = torch.ones((*depth.shape, self.n_classes)).squeeze(0).cuda() if semantics is None else semantics.squeeze(0)
             self.spatial_lr_scale = spatial_lr_scale
             # reproject points to 3D
             H, W, fx, fy, cx, cy = camera.get_params()

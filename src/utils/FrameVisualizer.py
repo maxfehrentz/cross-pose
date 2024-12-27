@@ -32,15 +32,15 @@ class FrameVisualizer(object):
         self.net = net
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    def save_imgs(self, idx, gt_depth, gt_color, c2w, pts_pred=None, pts_gt=None):
+    def save_imgs(self, idx, gt_depth, gt_color, c2w, pts_pred=None, pts_gt=None, mesh=None, registration=None):
         """
         Visualization of depth and color images and save to file.
         Args:
 
         """
         self.camera.set_c2w(c2w)
-        render_pkg = render(self.camera, self.net, self.background, deform=True)
-        self.plot_mapping(render_pkg['depth'], render_pkg['render'], gt_depth, gt_color)
+        render_pkg = render(self.camera, self.net, self.background, mesh=mesh, registration=registration, deform=True)
+        self.plot_mapping(render_pkg['depth'], render_pkg['render'], gt_depth, gt_color, render_pkg['mesh_surface'], render_pkg['mesh_depth'])
         outmap = os.path.join(self.outmap,f'{idx:05d}.jpg')
         plt.savefig(outmap, bbox_inches='tight', pad_inches=0.2, dpi=300)
         plt.close()
@@ -57,7 +57,7 @@ class FrameVisualizer(object):
             outrack = None
         return outmap, outsem, outrack
 
-    def plot_mapping(self, depth, color, gt_depth, gt_color):
+    def plot_mapping(self, depth, color, gt_depth, gt_color, mesh_surface=None, mesh_depth=None):
         gt_depth_np = gt_depth.squeeze(0).cpu().numpy()
         gt_color_np = gt_color.squeeze(0).cpu().numpy()
         depth_np = depth.squeeze(0).cpu().numpy()
@@ -67,36 +67,69 @@ class FrameVisualizer(object):
         color_residual = np.abs(gt_color_np - color_np)
         color_residual[gt_depth_np == 0.0] = 0.0
 
-        fig, axs = plt.subplots(2, 3)
+        if mesh_surface is not None and mesh_depth is not None:
+            mesh_surface_np = mesh_surface
+            mesh_depth_np = mesh_depth
+            fig, axs = plt.subplots(2, 4)
+        else:
+            fig, axs = plt.subplots(2, 3)
+
         max_depth = np.max(gt_depth_np)
+
+        print(f"estimated depth max: {max_depth}")
+        print(f"estimated depth min: {np.min(gt_depth_np)}")
+
+        print(f"mesh depth max: {np.max(mesh_depth_np)}")
+        print(f"mesh depth min: {np.min(mesh_depth_np)}")
+
+        print(f"mesh depth: {mesh_depth_np}")
 
         axs[0, 0].imshow(gt_depth_np, vmin=0, vmax=max_depth)
         axs[0, 0].set_title('Input Depth')
         axs[0, 0].set_xticks([])
         axs[0, 0].set_yticks([])
+
         axs[0, 1].imshow(depth_np, vmin=0, vmax=max_depth)
         axs[0, 1].set_title('Generated Depth')
         axs[0, 1].set_xticks([])
         axs[0, 1].set_yticks([])
+
         axs[0, 2].imshow(depth_residual, vmin=0, vmax=max_depth)
         axs[0, 2].set_title('Depth Residual')
         axs[0, 2].set_xticks([])
         axs[0, 2].set_yticks([])
+
         gt_color_np = np.clip(gt_color_np, 0, 1)
         color_np = np.clip(color_np, 0, 1)
         color_residual = np.clip(color_residual, 0, 1)
+
         axs[1, 0].imshow(gt_color_np)
         axs[1, 0].set_title('Input RGB')
         axs[1, 0].set_xticks([])
         axs[1, 0].set_yticks([])
+
         axs[1, 1].imshow(color_np)
         axs[1, 1].set_title('Generated RGB')
         axs[1, 1].set_xticks([])
         axs[1, 1].set_yticks([])
+
         axs[1, 2].imshow(color_residual)
         axs[1, 2].set_title('RGB Residual')
         axs[1, 2].set_xticks([])
         axs[1, 2].set_yticks([])
+
+        if mesh_surface is not None and mesh_depth is not None:
+
+            axs[0, 3].imshow(mesh_depth_np, vmin=0, vmax=max_depth)
+            axs[0, 3].set_title('Mesh Depth')
+            axs[0, 3].set_xticks([])
+            axs[0, 3].set_yticks([])
+
+            axs[1, 3].imshow(mesh_surface_np)
+            axs[1, 3].set_title('Mesh Input')
+            axs[1, 3].set_xticks([])
+            axs[1, 3].set_yticks([])
+
         plt.subplots_adjust(wspace=0, hspace=0)
         plt.tight_layout()
         return fig, axs

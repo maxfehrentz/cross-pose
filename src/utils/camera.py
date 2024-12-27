@@ -25,6 +25,8 @@ class Camera():
         self.fy = cfg['fy']
         self.cx = cfg['cx']
         self.cy = cfg['cy']
+        self.znear = cfg['znear']
+        self.zfar = cfg['zfar']
         self.point_src_light_model = cfg['point_src_light_model']
 
         # 4D Gaussians Viewpoint camera attributes
@@ -33,7 +35,7 @@ class Camera():
         self.image_height = self.H
         self.image_width = self.W
         self.c2w = None
-        self.projection_matrix = getProjectionMatrix(cfg['znear'], cfg['zfar'], self.W, self.H, self.fx, self.fy, self.cx, self.cy).transpose(0,1).cuda()
+        self.projection_matrix = getProjectionMatrix(self.znear, self.zfar, self.W, self.H, self.fx, self.fy, self.cx, self.cy).transpose(0,1).cuda()
         self.time = None
         i, j = torch.meshgrid(torch.linspace(0, self.W - 1, self.W, device="cuda"),
                               torch.linspace(0, self.H - 1, self.H, device="cuda"), indexing='ij')
@@ -46,6 +48,21 @@ class Camera():
 
     def set_time(self, time:float):
         self.time = time
+
+    def set_intrinsics(self, fx, fy, cx, cy):
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        self.projection_matrix = getProjectionMatrix(self.znear, self.zfar, self.W, self.H, self.fx, self.fy, self.cx, self.cy).transpose(0,1).cuda()
+        self.FoVx = focal2fov(self.fx, self.W)
+        self.FoVy = focal2fov(self.fy, self.H)
+        i, j = torch.meshgrid(torch.linspace(0, self.W - 1, self.W, device="cuda"),
+                              torch.linspace(0, self.H - 1, self.H, device="cuda"), indexing='ij')
+        cam_rays_d = torch.stack([(i.t()-self.cx)/self.fx, (j.t()-self.cy)/self.fy, torch.ones_like(i.t(), device="cuda")], -1)
+        cam_rays_d = (cam_rays_d / torch.linalg.norm(cam_rays_d, dim=-1, keepdims=True))
+        self.cos_alpha = cam_rays_d[..., 2].squeeze()
+
 
     @property
     def world_view_transform(self):

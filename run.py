@@ -12,10 +12,20 @@ from src.utils.camera import Camera
 from src.utils.FrameVisualizer import FrameVisualizer
 from src.utils.flow_utils import get_scene_flow, get_depth_from_raft
 from src.utils.PointTracker import PointTracker, mte, surv_2d, delta_2d
-from src.utils.datasets import StereoMIS
+from src.utils.datasets import StereoMIS, Atlas
 from src.utils.loss_utils import l1_loss
 from src.utils.renderer import render
 from src.scene.gaussian_model import GaussianModel
+
+# For Depth Anything V2
+import cv2
+import sys
+sys.path.append('Depth-Anything-V2')
+from metric_depth.depth_anything_v2.dpt import DepthAnythingV2
+
+
+# For the preoperative CT
+import pyvista as pv
 
 
 class SceneOptimizer():
@@ -28,7 +38,8 @@ class SceneOptimizer():
         self.device = cfg['device']
         self.output = cfg['data']['output']
 
-        self.frame_reader = StereoMIS(cfg, args, scale=self.scale)
+        self.frame_reader = Atlas(cfg, args, scale=self.scale)
+        # self.frame_reader = StereoMIS(cfg, args, scale=self.scale)
         self.n_img = len(self.frame_reader)
         self.frame_loader = DataLoader(self.frame_reader, batch_size=1, num_workers=0 if args.debug else 4)
         self.net = GaussianModel(cfg=cfg['model'])
@@ -51,7 +62,32 @@ class SceneOptimizer():
         self.last_frame = None
         self.raft = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(self.device)
         self.raft = self.raft.eval()
-        self.baseline = cfg['cam']['stereo_baseline']/1000.0*self.scale
+
+        # Checking for baseline, not available if monocular dataset
+        self.baseline = cfg['cam'].get('stereo_baseline', None)
+        if self.baseline is not None:
+            self.baseline = self.baseline / 1000.0 * self.scale
+
+        # Checking for mesh
+        self.mesh = cfg.get('mesh', None)
+        # Load mesh
+        if self.mesh is not None:
+            self.mesh = pv.read(self.mesh)
+
+        # Initialize Depth Anything V2 model; using metric depth estimation as described here
+        # https://github.com/DepthAnything/Depth-Anything-V2/tree/main/metric_depth
+        model_configs = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+        }
+        encoder = 'vitl'
+        dataset = 'hypersim' # 'hypersim' or 'vkitti
+        # TODO: document the "scaling factor" max depth in the Readme if this is used in the end
+        self.depth_anything = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': .2})
+        self.depth_anything.load_state_dict(torch.load(f'Depth-Anything-V2/checkpoints/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
+        self.depth_anything = self.depth_anything.to(self.device).eval()
+
 
     def fit(self, frame, iters, incremental):
         self.net.reset_optimizer()
@@ -116,15 +152,42 @@ class SceneOptimizer():
         torch.cuda.empty_cache()
         pt_track_stats = {"pred_2d": []}
 
-        for ids, gt_color, gt_color_r, gt_c2w, tool_mask, semantics in tqdm(self.frame_loader, total=self.n_img):
+        for ids, gt_color, gt_color_r, gt_c2w, registration, tool_mask, semantics, intrinsics in tqdm(self.frame_loader, total=self.n_img):
             gt_color = gt_color.cuda()
-            gt_color_r = gt_color_r.cuda()
+            gt_color_r = gt_color_r.cuda() if gt_color_r is not None else None
             gt_c2w = gt_c2w.cuda()
             tool_mask = tool_mask.cuda() if tool_mask is not None else None
             semantics = semantics.float().cuda() if semantics is not None else None
             with torch.no_grad():
-                gt_depth, flow_valid = get_depth_from_raft(self.raft, gt_color, gt_color_r, self.baseline)
+                # Check if stereo is available
+                if gt_color_r is not None:
+                    gt_depth, flow_valid = get_depth_from_raft(self.raft, gt_color, gt_color_r, self.baseline)
+                else:
+                    # Reversing preprocessing
+                    raw_gt_color = gt_color.squeeze().cpu().numpy() * 255
+                    raw_gt_color = raw_gt_color.astype(np.uint8)
+                    raw_gt_color = cv2.cvtColor(raw_gt_color, cv2.COLOR_RGB2BGR)
+
+                    # Use Depth Anything V2 to infer depth on monocular datasets; requires raw image data as np array
+                    input_size_depth = 512
+
+                    # Multiplying by 100 to get centimeters, although some github issues claim it outputs dm
+                    # Also, beware that the metric depth estimation of this model seems to be highly specific to the
+                    #  datasets it was trained on since it only outputs 0-1 values and is then scaled by max_depth
+                    #  which was fixed for each dataset. Therefore, it is highly unlikely that we have a real metric
+                    #  depth estimation on our OOD data here. We just got lucky with choosing the 'right' although
+                    #  potentially metrically meaningless max_depth value for our dataset.
+                    gt_depth = self.depth_anything.infer_image(raw_gt_color, input_size=input_size_depth) * 100
+
+                    # Make sure the depth map is in the correct format
+                    gt_depth = torch.from_numpy(gt_depth).cuda().unsqueeze(0)
+
             frame = ids, gt_color, gt_depth, gt_c2w, tool_mask
+
+            # Set cam intrinsics if available
+            if intrinsics is not None:
+                intrinsics = torch.squeeze(intrinsics)
+                self.camera.set_intrinsics(fx=intrinsics[0], fy=intrinsics[1], cx=intrinsics[2], cy=intrinsics[3])
 
             if ids.item() == 0:
                 self.net.create_from_pcd(gt_color, gt_depth, gt_c2w, self.camera, tool_mask, semantics=semantics)
@@ -168,9 +231,11 @@ class SceneOptimizer():
                 else:
                     pts_2d, pts_2d_gt = None, None
                 if self.visualize:
-
+                    # Pass a copy of mesh, will be modified by the visualizer
+                    mesh_copy = self.mesh.copy() if self.mesh is not None else None
                     outmap, outsem, outrack = self.visualizer.save_imgs(ids.item(), gt_depth, gt_color,
-                                                                        gt_c2w, pts_2d, pts_2d_gt)
+                                                                        gt_c2w, pts_2d, pts_2d_gt, mesh=mesh_copy,
+                                                                        registration=registration)
                     if self.log:
                         log_dict.update({'mapping': wandb.Image(outmap),
                                          'tracking': wandb.Image(outrack) if outrack is not None else None,

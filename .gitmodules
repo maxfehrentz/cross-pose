@@ -4,3 +4,9 @@
 [submodule "src/submodules/simple-knn"]
 	path = src/submodules/simple-knn
 	url = https://gitlab.inria.fr/bkerbl/simple-knn.git
+[submodule "Depth-Anything-V2"]
+	path = Depth-Anything-V2
+	url = https://github.com/DepthAnything/Depth-Anything-V2.git
+[submodule "dust3r"]
+	path = dust3r
+	url = https://github.com/naver/dust3r.git

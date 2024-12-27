@@ -1,0 +1,21 @@
+inherit_from: configs/base.yaml
+device: cuda
+scale: 10 # apparently necessary to be in correct metric; guessing mm to cm
+dataset: 'ATLAS'
+mesh: /home/fsc/max/Data/Pigs/ImFusionExport_1segmentation_cleaned_reduced_shellsremoved_holesClosed.obj
+cam:
+  H: 540
+  W: 960
+  fx: 587.36083984375
+  fy: 587.36083984375
+  cx: 529.1632080078125
+  cy: 271.7477111816406
+
+data:
+  input_folder: /home/fsc/max/Data/Pigs/posed_data_half_res
+  output: output/ATLAS/
+
+training:
+  optical_flow_init: False
+  w_depth: 10 # default: 10
+  w_color: 5 # default: 5

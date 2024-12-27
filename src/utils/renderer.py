@@ -15,8 +15,156 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from src.scene.gaussian_model import GaussianModel
 from src.utils.sh_utils import RGB2SH
 
+# Imports for dealing with the mesh
+import pyvista as pv
+import vtk
 
-def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, deform=True, render_deformation=False):
+# TODO: Read camera poses, only for debugging
+import json
+import numpy as np
+
+
+def reverse_cam_convention_changes(c2w):
+    # Swap and flip axes back from opencv to opengl convention; see datasets.py for explanation
+    swap_and_flip_world_axes = torch.tensor([[0, 1, 0, 0],
+                                             [1, 0, 0, 0],
+                                             [0, 0, -1, 0],
+                                             [0, 0, 0, 1]], dtype=torch.float32).to(c2w.device)
+    c2w = swap_and_flip_world_axes @ c2w
+
+    # Flip y and z axis again to go back to nerfstudio convention
+    flip_cam_axes = torch.tensor([[1, 0, 0, 0],
+                                  [0, -1, 0, 0],
+                                  [0, 0, -1, 0],
+                                  [0, 0, 0, 1]], dtype=torch.float32).to(c2w.device)
+    c2w = c2w @ flip_cam_axes
+
+    # TODO: Divide the translation by scale again, hardcode for now, fix later
+    c2w[:3, 3] = c2w[:3, 3] / 10
+
+    return c2w
+
+
+def add_mesh_to_plotter(mesh, registration, plotter):
+    registration = registration.squeeze(0)
+
+    transform_scale = vtk.vtkTransform()
+    # Scale the mesh; not sure why this is necessary
+    transform_scale.Scale(.001, .001, .001)
+    mesh.transform(transform_scale)
+
+    # Unsure why this is necessary, but mesh seems to be flipped; mirror the mesh along the x axis
+    transform_mirror = vtk.vtkTransform()
+    transform_mirror.Scale(-1, 1, 1)
+    mesh.transform(transform_mirror)
+
+    # Create a registration transform for the mesh
+    registration_matrix = vtk.vtkMatrix4x4()
+    for i in range(4):
+        for j in range(4):
+            registration_matrix.SetElement(i, j, registration[i, j])
+    transform_register = vtk.vtkTransform()
+    # Applying 4x4 directly
+    transform_register.SetMatrix(registration_matrix)
+    mesh.transform(transform_register)
+
+    # Add the mesh to the plotter
+    _ = plotter.add_mesh(mesh, smooth_shading=True, lighting=True, diffuse=1, opacity=1)
+
+
+# TODO: remove later, only for debugging
+def add_cameras_to_plotter(plotter):
+    # TODO: hardcoded for now, method just for debugging
+    with open('/home/fsc/max/Data/Pigs/posed_data_half_res/transforms_cleaned.json', 'r') as f:
+        data = json.load(f)
+
+    frames = data['frames']
+    poses = np.array([frame['transform_matrix'] for frame in frames], dtype=float)
+
+    # For the poses during optimization
+    pts = [pose[:3, 3] for pose in poses]
+    dirs = [-pose[:3, 2] for pose in poses]
+    ups = [pose[:3, 1] for pose in poses]
+
+    for i, (p, dir) in enumerate(zip(pts, dirs)):
+        a = pv.Cone(p, -dir, radius=.01, height=.01, resolution=4, capping=True)
+        _ = plotter.add_mesh(a, color='white', show_edges=True, style='wireframe', line_width=4)
+
+
+def set_initial_camera(viewpoint_camera, plotter):
+    # Get the current c2w matrix
+    c2w = viewpoint_camera.c2w
+    # Bring back to OpenGL convention
+    c2w = reverse_cam_convention_changes(c2w)
+    # Direction and up vector follow because each column in the rotation matrix represents where the unit vector of that
+    #  axis would end up after the rotation; e.g, first column of R is where the x-axis would end up after the rotation.
+    #  In VTK convention, the camera looks towards -Z and Y is up, that's why the second and (negative) third column
+    #  represent the view-up and direction after rotation.
+    pos = c2w[:3, 3]
+    dir = -c2w[:3, 2]
+    focal_point = pos + dir
+    up = c2w[:3, 1]
+
+    # Get vtk camera
+    cam = plotter.camera
+    # Set camera extrinsics
+    cam.SetPosition(pos[0].item(), pos[1].item(), pos[2].item())
+    cam.SetFocalPoint(focal_point[0].item(), focal_point[1].item(), focal_point[2].item())
+    cam.SetViewUp(up[0].item(), up[1].item(), up[2].item())
+    plotter.camera = cam
+
+
+# TODO: remove later, only for debugging
+def debug_mesh(viewpoint_camera, mesh, registration):
+    plotter = pv.Plotter(off_screen=False, window_size=[viewpoint_camera.image_width, viewpoint_camera.image_height])
+    plotter.set_background('black')
+
+    add_mesh_to_plotter(mesh, plotter)
+    add_cameras_to_plotter(plotter)
+    set_initial_camera(viewpoint_camera, plotter)
+
+    # Add axes for debugging
+    axes_actor = pv.Axes().axes_actor
+    axes_actor.shaft_length = 1
+    _ = plotter.add_actor(axes_actor)
+
+    # Show the plotter
+    plotter.show(auto_close=False, interactive_update=True)
+
+    # Keep rendering and listening to key events
+    while True:
+        plotter.update()
+    return
+
+
+def render_mesh(viewpoint_camera, mesh, registration):
+    plotter = pv.Plotter(off_screen=True, window_size=[viewpoint_camera.image_width, viewpoint_camera.image_height])
+    plotter.set_background('black')
+
+    add_mesh_to_plotter(mesh, registration, plotter)
+    set_initial_camera(viewpoint_camera, plotter)
+
+    # Get vtk camera
+    cam = plotter.camera
+
+    # Get intrinsics and set them in the vtk camera as well, converting radians to degrees
+    cam.view_angle = viewpoint_camera.FoVy * 180 / math.pi
+
+    plotter.camera = cam
+
+    # Show the plotter
+    plotter.show()
+
+    mesh_surface = plotter.screenshot(filename="output/ATLAS/screenshot.png", transparent_background=True,
+                                      return_img=True)
+    # Get depth image, scaling to get what I believe is cm; - to get the depth in the right direction
+    mesh_depth = -10 * plotter.get_image_depth()
+
+    return mesh_surface, mesh_depth
+
+
+
+def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, mesh = None, registration = None, scaling_modifier = 1.0, override_color = None, deform=True, render_deformation=False):
     """
     Render the scene. 
     
@@ -76,11 +224,29 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scalin
     rendered_image = viewpoint_camera.spotlight_render(rendered_image, depth.detach())
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,
-            "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
-            "radii": radii,
-            "depth":depth,
-            "alpha": alpha.squeeze(0),
-            "semantics": rendered_semantics}
+
+    # If a mesh is available, render the mesh and its depth as well
+    if mesh is not None and registration is not None:
+        mesh_surface, mesh_depth = render_mesh(viewpoint_camera, mesh, registration)
+        #debug_mesh(viewpoint_camera, mesh, registration)
+        return {"render": rendered_image,
+                "viewspace_points": screenspace_points,
+                "visibility_filter" : radii > 0,
+                "radii": radii,
+                "depth":depth,
+                "alpha": alpha.squeeze(0),
+                "semantics": rendered_semantics,
+                "mesh_surface": mesh_surface,
+                "mesh_depth": mesh_depth}
+
+    else:
+        return {"render": rendered_image,
+                "viewspace_points": screenspace_points,
+                "visibility_filter" : radii > 0,
+                "radii": radii,
+                "depth":depth,
+                "alpha": alpha.squeeze(0),
+                "semantics": rendered_semantics,
+                "mesh_surface": None,
+                "mesh_depth": None}
 
