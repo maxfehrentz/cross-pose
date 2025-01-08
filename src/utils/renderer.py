@@ -14,6 +14,8 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from src.scene.gaussian_model import GaussianModel
 from src.utils.sh_utils import RGB2SH
+from src.utils.mesh_utils import register_mesh
+from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES, FLIP_CAM_AXES, SCALE
 
 # Imports for dealing with the mesh
 import pyvista as pv
@@ -26,48 +28,21 @@ import numpy as np
 
 def reverse_cam_convention_changes(c2w):
     # Swap and flip axes back from opencv to opengl convention; see datasets.py for explanation
-    swap_and_flip_world_axes = torch.tensor([[0, 1, 0, 0],
-                                             [1, 0, 0, 0],
-                                             [0, 0, -1, 0],
-                                             [0, 0, 0, 1]], dtype=torch.float32).to(c2w.device)
+    swap_and_flip_world_axes = SWAP_AND_FLIP_WORLD_AXES.to(c2w.device)
     c2w = swap_and_flip_world_axes @ c2w
 
     # Flip y and z axis again to go back to nerfstudio convention
-    flip_cam_axes = torch.tensor([[1, 0, 0, 0],
-                                  [0, -1, 0, 0],
-                                  [0, 0, -1, 0],
-                                  [0, 0, 0, 1]], dtype=torch.float32).to(c2w.device)
+    flip_cam_axes = FLIP_CAM_AXES.to(c2w.device)
     c2w = c2w @ flip_cam_axes
 
-    # TODO: Divide the translation by scale again, hardcode for now, fix later
-    c2w[:3, 3] = c2w[:3, 3] / 10
+    # Divide the translation by scale again
+    c2w[:3, 3] = c2w[:3, 3] / SCALE
 
     return c2w
 
 
 def add_mesh_to_plotter(mesh, registration, plotter):
-    registration = registration.squeeze(0)
-
-    transform_scale = vtk.vtkTransform()
-    # Scale the mesh; not sure why this is necessary
-    transform_scale.Scale(.001, .001, .001)
-    mesh.transform(transform_scale)
-
-    # Unsure why this is necessary, but mesh seems to be flipped; mirror the mesh along the x axis
-    transform_mirror = vtk.vtkTransform()
-    transform_mirror.Scale(-1, 1, 1)
-    mesh.transform(transform_mirror)
-
-    # Create a registration transform for the mesh
-    registration_matrix = vtk.vtkMatrix4x4()
-    for i in range(4):
-        for j in range(4):
-            registration_matrix.SetElement(i, j, registration[i, j])
-    transform_register = vtk.vtkTransform()
-    # Applying 4x4 directly
-    transform_register.SetMatrix(registration_matrix)
-    mesh.transform(transform_register)
-
+    register_mesh(mesh, registration)
     # Add the mesh to the plotter
     _ = plotter.add_mesh(mesh, smooth_shading=True, lighting=True, diffuse=1, opacity=1)
 

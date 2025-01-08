@@ -145,7 +145,9 @@ class FrameVisualizer(object):
         semantics = torch.argmax(render_pkg['semantics'], dim=0)
         semantics[render_pkg['alpha'] < thr] = 0
         semantics = self.decoder.colorize_label(semantics.cpu().numpy()) / 255.0
-        vis_img = 0.7*render_pkg['render'].cpu().numpy() + 0.3*semantics
+        # TODO: revert this later, abusing this for debugging for nice visualization without semantics
+        #vis_img = 0.7*render_pkg['render'].cpu().numpy() + 0.3*semantics
+        vis_img = 1.0*render_pkg['render'].cpu().numpy() + 0.0*semantics
         vis_img = (255*vis_img).clip(0, 255).astype(np.uint8)
         return vis_img
 

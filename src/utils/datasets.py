@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 from scipy.spatial.transform import Rotation
 from scipy.ndimage import binary_erosion
 from src.utils.semantic_utils import SemanticDecoder
+from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES, FLIP_CAM_AXES
 
 
 class Atlas(Dataset):
@@ -23,7 +24,8 @@ class Atlas(Dataset):
             self.input_folder = args.input_folder
 
         # Load cameras and image and mask paths
-        self.poses, self.color_paths, self.mask_paths, self.registration_matrices = self.load_cams_and_filepaths(os.path.join(self.input_folder, 'transforms_half_res_registered.json'))
+        self.poses, self.color_paths, self.mask_paths, self.registration_matrices = self.load_cams_and_filepaths(
+            os.path.join(self.input_folder, 'transforms.json'))
 
         # TODO: what about semantic decoder? ignore for now
         # self.semantic_decoder = SemanticDecoder()
@@ -60,23 +62,11 @@ class Atlas(Dataset):
 
         # See Nerfstudio conventions here https://docs.nerf.studio/quickstart/data_conventions.html
 
-        # Reorient camera in camera space; flip y and z axes (OpenGL/Blender/Nerfstudio to COLMAP/OpenCV convention)
-        flip_cam_axes = torch.tensor([[1, 0, 0, 0],
-                          [0, -1, 0, 0],
-                          [0, 0, -1, 0],
-                          [0, 0, 0, 1]], dtype=torch.float32)
-        poses = poses @ flip_cam_axes
+        # Reorient camera in camera space
+        poses = poses @ FLIP_CAM_AXES
 
-        # From same nerfstudio conventions source: "Our world space is oriented such that the up vector is +Z. The XY
-        #  plane is parallel to the ground plane. In their colmap -> nerfstudio conversion, they swap x and y axes
-        #  in the world space and then flip z. There is no explanation provided but my hypothesis is that this brings it
-        #  to COLMAP/OpenCV world space convention which I could not find online.
-        #  See also code here: https://github.com/nerfstudio-project/nerfstudio/blob/079f419e544b8d2aa6aad6f1a31decf0e06cb88c/nerfstudio/process_data/colmap_utils.py#L620-L621
-        swap_and_flip_world_axes = torch.tensor([[0, 1, 0, 0],
-                          [1, 0, 0, 0],
-                          [0, 0, -1, 0],
-                          [0, 0, 0, 1]], dtype=torch.float32)
-        poses = swap_and_flip_world_axes @ poses
+        # Reorient world space
+        poses = SWAP_AND_FLIP_WORLD_AXES @ poses
 
         return poses, color_paths, mask_paths, registration_matrices
 

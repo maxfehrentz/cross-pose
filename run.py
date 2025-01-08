@@ -16,6 +16,8 @@ from src.utils.datasets import StereoMIS, Atlas
 from src.utils.loss_utils import l1_loss
 from src.utils.renderer import render
 from src.scene.gaussian_model import GaussianModel
+from src.utils.mesh_utils import preprocess_mesh
+from src.utils.transform_utils import SCALE
 
 # For Depth Anything V2
 import cv2
@@ -34,7 +36,7 @@ class SceneOptimizer():
         self.cfg = cfg
         self.args = args
         self.visualize = args.visualize
-        self.scale = cfg['scale']
+        self.scale = SCALE
         self.device = cfg['device']
         self.output = cfg['data']['output']
 
@@ -73,6 +75,8 @@ class SceneOptimizer():
         # Load mesh
         if self.mesh is not None:
             self.mesh = pv.read(self.mesh)
+            # Preprocesses mesh in place
+            preprocess_mesh(self.mesh)
 
         # Initialize Depth Anything V2 model; using metric depth estimation as described here
         # https://github.com/DepthAnything/Depth-Anything-V2/tree/main/metric_depth
@@ -107,7 +111,10 @@ class SceneOptimizer():
             # Loss
             Ll1 = self.cfg['training']['w_color']*l1_loss(color[tool_mask], gt_color[tool_mask])
             Ll1_depth = self.cfg['training']['w_depth']*l1_loss(depth[tool_mask]/self.scale, gt_depth[tool_mask]/self.scale)
-            loss = Ll1 + Ll1_depth
+            # TODO: depth loss taken out for now, come back to this
+            #loss = Ll1 + Ll1_depth
+            loss = Ll1
+
             if incremental:
                 l_rigidtrans, l_rigidrot, l_iso, l_visible = self.net.compute_regulation(render_pkg["visibility_filter"])
                 def_loss = self.cfg['training']['w_def']['rigid']*l_rigidtrans + self.cfg['training']['w_def']['iso']*l_iso+ self.cfg['training']['w_def']['rot']*l_rigidrot+ self.cfg['training']['w_def']['nvisible']*l_visible
@@ -138,10 +145,10 @@ class SceneOptimizer():
                     av_loss = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
 
                 self.net.add_densification_stats(viewspace_point_tensor_grad, render_pkg["visibility_filter"])
-                if not incremental:
-                    # Densification
-                    if iter > self.cfg["training"]["densify_from_iter"] and iter % self.cfg["training"]["densification_interval"] == 0:
-                        self.net.densify(self.cfg["training"]["densify_grad_threshold"])
+
+                # Densification
+                if iter > self.cfg["training"]["densify_from_iter"] and iter % self.cfg["training"]["densification_interval"] == 0:
+                    self.net.densify(self.cfg["training"]["densify_grad_threshold"])
 
                 # Optimizer step
                 if iter < iters:
@@ -190,7 +197,10 @@ class SceneOptimizer():
                 self.camera.set_intrinsics(fx=intrinsics[0], fy=intrinsics[1], cx=intrinsics[2], cy=intrinsics[3])
 
             if ids.item() == 0:
-                self.net.create_from_pcd(gt_color, gt_depth, gt_c2w, self.camera, tool_mask, semantics=semantics)
+                # Note that we are using the matrix coming from the first frame; some datasets provide a registration
+                #  matrix for each frame, but we are using the first frame's matrix for all frames since they do not
+                #  change significantly unless the operating table is moved
+                self.net.create_from_mesh(self.mesh.copy(), registration, gt_depth)
                 self.net.training_setup(self.cfg['training'])
                 self.fit(frame, iters=self.cfg['training']['iters_first'], incremental=False)
             else:
@@ -198,23 +208,14 @@ class SceneOptimizer():
                     if self.cfg['training']['grad_weighing']:
                         self.net.enable_grad_weighing(True)
 
-                with torch.no_grad():
-                    # add new points
-                    self.camera.set_c2w(gt_c2w)
-                    render_pkg = render(self.camera, self.net, self.background, deform=True)
-                    mask = render_pkg['alpha'][None,...,None].squeeze(-1) < 0.95
-                    mask &= tool_mask
-                    self.net.add_from_pcd(gt_color, gt_depth, gt_c2w, self.camera, mask, semantics=semantics) if self.cfg['training']['add_points'] else 0.0
-
-                    # optical flow init
-                    if self.cfg['training']['optical_flow_init']:
-                        scene_flow, anchor_pts, valid = get_scene_flow(self.raft, render_pkg['render'][None,...], gt_color, render_pkg['depth'][None,...],gt_depth, tool_mask, self.camera)
-                        valid &= tool_mask.squeeze(0) & flow_valid.squeeze(0)
-                        tree = KDTree(anchor_pts[valid].cpu().numpy())
-                        neighbour_dists, neighbours = tree.query(self.net._deformation.get_deformed_means(self.net.get_xyz).cpu().numpy(), k=3)#, eps=0.1)
-                        weights = torch.exp(-50.0*(torch.from_numpy(neighbour_dists).cuda()))
-                        deformation = scene_flow[valid][torch.from_numpy(neighbours).cuda()]
-                        self.net._deformation.init_from_flow(deformation.clamp(-0.01, 0.01), weights)
+                #with torch.no_grad():
+                #    # add new points
+                #    self.camera.set_c2w(gt_c2w)
+                #    # Have to render to get the current alpha values; only adding Gaussians if opactiy < threshold
+                #    render_pkg = render(self.camera, self.net, self.background, deform=True)
+                #    mask = render_pkg['alpha'][None,...,None].squeeze(-1) < 0.95
+                #    mask &= tool_mask
+                #    self.net.add_from_pcd(gt_color, gt_depth, gt_c2w, self.camera, mask, semantics=semantics) if self.cfg['training']['add_points'] else 0.0
 
                 self.fit(frame, iters=self.cfg['training']['iters'], incremental=True)
             self.last_frame = gt_color.detach()

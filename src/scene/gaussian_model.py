@@ -1,6 +1,9 @@
 import torch
 from torch import nn
+import numpy as np
 from src.utils.sh_utils import RGB2SH
+from src.utils.mesh_utils import register_mesh
+from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES, SCALE
 from simple_knn._C import distCUDA2
 from src.utils.general_utils import strip_symmetric, build_scaling_rotation, build_inv_cov, inverse_sigmoid, build_rotation
 from src.scene.deformation import ExplicitDeformation, ExplicitSparseDeformation
@@ -54,6 +57,10 @@ class GaussianModel(nn.Module):
         """
             apply deformation and return 3D Gaussians for rasterization
         """
+        # TODO: not sure why this yields so much better results, come back to this
+        # Disable gradient for scaling
+        self._scaling.requires_grad_(False)
+
         if deform:
             xyz, scales, rots = self._deformation(self._xyz, self._scaling, self._rotation, init=self.training)
         else:
@@ -124,6 +131,48 @@ class GaussianModel(nn.Module):
                                    scales[selected_pts_mask], rots[selected_pts_mask],
                                    semantics[selected_pts_mask])
         return selected_pts_mask.float().mean()
+
+    def create_from_mesh(self, mesh, registration, depth):
+        register_mesh(mesh, registration)
+
+        # Compute triangle centers
+        triangle_centers = torch.tensor(mesh.cell_centers().points, dtype=torch.float32).reshape(-1,3).cuda()
+
+        # Have to apply the same world coordinate convention change and scaling to go to Nerfstudio convention as the
+        #  cameras, see dataloader
+        transform = SWAP_AND_FLIP_WORLD_AXES.to(triangle_centers.device)
+        triangle_centers = (transform[:3, :3] @ triangle_centers.T).T * SCALE
+
+        points = triangle_centers
+        rgb_norm = torch.ones_like(points)
+        # TODO: Fused stuff here came initally from additional tool masking; have to add that later, see create_from_pcd
+        fused_point_cloud = points
+        fused_color = RGB2SH(rgb_norm)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        # Computing distance between points, using as heuristic to compute scale
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.6*torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        # TODO: fix _semantics later if necessary, see create_from_pcd
+        # TODO: unintuitive that we need depth to intialize the shape here, should change that as well. Misleading since
+        #  we do not need the actual depth
+        self._semantics = torch.ones((*depth.shape, self.n_classes)).squeeze(0).cuda()
+        self._deformation = self._deformation.to("cuda")
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._deformation.add_gaussians(self._xyz.shape[0], self._xyz)
+
 
     def create_from_pcd(self, rgb, depth, c2w, camera, tool_mask=None, spatial_lr_scale : float=1.0, downsample: int=2, semantics=None):
         with torch.no_grad():
@@ -218,7 +267,8 @@ class GaussianModel(nn.Module):
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         self.gradient_accum = self.gradient_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
-        self._semantics = self._semantics[valid_points_mask]
+        # TODO: fix semantics later
+        # self._semantics = self._semantics[valid_points_mask]
         self.enable_grad_weighing(grad_weighing)
         self._deformation.replace(optimizable_tensors['deformation'], optimizable_tensors['xyz'], reinit=True)
 
@@ -277,7 +327,8 @@ class GaussianModel(nn.Module):
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.gradient_accum = torch.cat((self.gradient_accum, torch.zeros((new_xyz.shape[0], 1), device="cuda")), dim=0)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self._semantics = torch.cat((self._semantics, new_semantics), dim=0)
+        # TODO: fix semantics later
+        # self._semantics = torch.cat((self._semantics, new_semantics), dim=0)
         self.enable_grad_weighing(grad_weighing)
         self._deformation.replace(optimizable_tensors['deformation'], optimizable_tensors['xyz'], reinit=False)
 
@@ -304,7 +355,9 @@ class GaussianModel(nn.Module):
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
-        new_semantics = self._semantics[selected_pts_mask].repeat(N,1)
+        # TODO: fix the semantics issues later if necessary
+        # new_semantics = self._semantics[selected_pts_mask].repeat(N,1)
+        new_semantics = self._semantics
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantics)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -324,7 +377,9 @@ class GaussianModel(nn.Module):
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        new_semantics = self._semantics[selected_pts_mask]
+        # TODO: fix this semantics issue later
+        # new_semantics = self._semantics[selected_pts_mask]
+        new_semantics = self._semantics
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_semantics)
 
