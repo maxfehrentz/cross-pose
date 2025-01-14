@@ -9,6 +9,7 @@ from src.utils.general_utils import strip_symmetric, build_scaling_rotation, bui
 from src.scene.deformation import ExplicitDeformation, ExplicitSparseDeformation
 from src.utils.flow_utils import get_surface_pts
 from functools import partial
+from vtk.util.numpy_support import vtk_to_numpy
 
 
 class GaussianModel(nn.Module):
@@ -132,17 +133,15 @@ class GaussianModel(nn.Module):
                                    semantics[selected_pts_mask])
         return selected_pts_mask.float().mean()
 
-    def create_from_mesh(self, mesh, registration, depth):
+    def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0):
+        self.spatial_lr_scale = spatial_lr_scale
         register_mesh(mesh, registration)
-
         # Compute triangle centers
         triangle_centers = torch.tensor(mesh.cell_centers().points, dtype=torch.float32).reshape(-1,3).cuda()
-
         # Have to apply the same world coordinate convention change and scaling to go to Nerfstudio convention as the
         #  cameras, see dataloader
         transform = SWAP_AND_FLIP_WORLD_AXES.to(triangle_centers.device)
         triangle_centers = (transform[:3, :3] @ triangle_centers.T).T * SCALE
-
         points = triangle_centers
         rgb_norm = torch.ones_like(points)
         # TODO: Fused stuff here came initally from additional tool masking; have to add that later, see create_from_pcd
@@ -151,15 +150,12 @@ class GaussianModel(nn.Module):
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
-
         # Computing distance between points, using as heuristic to compute scale
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
-
         opacities = inverse_sigmoid(0.6*torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         # TODO: fix _semantics later if necessary, see create_from_pcd
         # TODO: unintuitive that we need depth to intialize the shape here, should change that as well. Misleading since
@@ -172,7 +168,6 @@ class GaussianModel(nn.Module):
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._deformation.add_gaussians(self._xyz.shape[0], self._xyz)
-
 
     def create_from_pcd(self, rgb, depth, c2w, camera, tool_mask=None, spatial_lr_scale : float=1.0, downsample: int=2, semantics=None):
         with torch.no_grad():
@@ -450,3 +445,120 @@ class GaussianModel(nn.Module):
                     stored_state["exp_avg_sq"][:] = 0.0
                     stored_state["state_step"] = 0
                     self.optimizer.state[group['params'][idx]] = stored_state
+
+
+class MeshAwareGaussianModel(GaussianModel):
+    def __init__(self, cfg, n_classes=7):
+        super().__init__(cfg, n_classes)
+        self.mesh_vertices = None
+        self.mesh_faces = None
+        self.barycentric_coords = None
+        self._xyz = torch.empty(0)
+
+    @property
+    def get_xyz(self):
+        return self._xyz
+        
+    def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0):
+        self.spatial_lr_scale = spatial_lr_scale
+
+        register_mesh(mesh, registration)
+        
+        # Get vertices
+        vertices = torch.tensor(mesh.points, dtype=torch.float32)
+        # Reorient and scale
+        transform = SWAP_AND_FLIP_WORLD_AXES
+        vertices = (transform[:3, :3] @ vertices.T).T * SCALE
+        vertices = vertices.cuda()
+
+        # Get faces (see explanation here https://stackoverflow.com/questions/51201888/retrieving-facets-and-point-from-vtk-file-in-python)
+        triangle_cells = mesh.GetPolys()
+        face_array = triangle_cells.GetData()
+        faces = torch.tensor(vtk_to_numpy(face_array).reshape(-1, 4)[:, 1:], dtype=torch.int64).cuda()
+        
+        # Make vertices optimizable parameters
+        self.mesh_vertices = nn.Parameter(vertices.requires_grad_(True))
+        # Topology is constant
+        n_triangles = faces.shape[0]
+        self.mesh_faces = faces
+        
+        # TODO: change later, fixing this and not making it a parameter for now
+        # self.barycentric_coords = nn.Parameter(torch.ones(
+        #     n_triangles, 3).cuda() / 3.0)   
+        self.barycentric_coords = torch.ones(n_triangles, 3).cuda() / 3.0
+
+        xyz = self.compute_positions()
+
+        # TODO: remove later if possible, super hacky; for some reason, just allocating a dummy tensor fixes the illegal memory access issues?? memory alignment issue?
+        dummy_tensor = torch.zeros((xyz.shape[0], 3), dtype=torch.float32, device="cuda")
+        
+        # Initialize other parameters as before
+        rgb_norm = torch.ones((n_triangles, 3)).cuda()
+        fused_color = RGB2SH(rgb_norm)
+        features = torch.zeros((n_triangles, 3, (self.max_sh_degree + 1) ** 2), device="cuda")
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+        
+        # Initialize scales, rotations, opacities
+        dist2 = torch.clamp_min(distCUDA2(xyz), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((n_triangles, 4), device="cuda")
+        rots[:, 0] = 1
+        opacities = inverse_sigmoid(0.6*torch.ones((n_triangles, 1), device="cuda"))
+
+        self._xyz = xyz
+        # Store as parameters with explicit contiguous memory layout
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        
+        # Initialize semantics if needed
+        self._semantics = torch.ones((*depth.shape, self.n_classes), device="cuda").squeeze(0)
+
+    def training_setup(self, training_args):
+        self.percent_dense = training_args["percent_dense"]
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        l = [
+            {'params': [self.mesh_vertices], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "mesh_vertices"},
+            # {'params': [self._xyz], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "xyz"},
+            # {'params': [self.barycentric_coords], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "barycentric"},
+            # {'params': [self.normal_offsets], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "offsets"},
+            {'params': [self._features_dc], 'lr': training_args["feature_lr"], "name": "f_dc"},
+            {'params': [self._features_rest], 'lr': training_args["feature_lr"] / 20.0, "name": "f_rest"},
+            {'params': [self._opacity], 'lr': training_args["opacity_lr"], "name": "opacity"},
+            {'params': [self._scaling], 'lr': training_args["scaling_lr"], "name": "scaling"},
+            {'params': [self._rotation], 'lr': training_args["rotation_lr"], "name": "rotation"}
+        ]
+
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        
+    def compute_positions(self):          
+        # Get vertices for each triangle face
+        v0 = self.mesh_vertices[self.mesh_faces[:, 0]]
+        v1 = self.mesh_vertices[self.mesh_faces[:, 1]]
+        v2 = self.mesh_vertices[self.mesh_faces[:, 2]]
+
+        # Compute triangle centers as position for each Gaussian
+        positions = ((v0 + v1 + v2) / 3.0)
+
+        return positions
+        
+    def forward(self, deform=True):
+        # TODO: not sure why this yields so much better results, come back to this
+        # Disable gradient for scaling
+        self._scaling.requires_grad_(False)
+        
+        # Compute Gaussian positions from mesh and parameters
+        xyz = self.compute_positions()
+        
+        # Apply scaling, rotation, etc. as before
+        scales = self.scaling_activation(self._scaling)
+        rots = self.rotation_activation(self._rotation)
+        opacity = self.opacity_activation(self._opacity)
+        
+        return xyz, scales, rots, opacity, self.get_features, self.get_semantics

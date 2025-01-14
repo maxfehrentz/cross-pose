@@ -139,7 +139,7 @@ def render_mesh(viewpoint_camera, mesh, registration):
 
 
 
-def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, mesh = None, registration = None, scaling_modifier = 1.0, override_color = None, deform=True, render_deformation=False):
+def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, mesh = None, registration = None, scaling_modifier = 1.0, override_color = None, deform=True, render_deformation=False, deformed_mesh=None):
     """
     Render the scene. 
     
@@ -154,7 +154,6 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, mesh =
         pass
 
     # Set up rasterization configuration
-    
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
     raster_settings = GaussianRasterizationSettings(
@@ -200,19 +199,29 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, mesh =
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
 
-    # If a mesh is available, render the mesh and its depth as well
-    if mesh is not None and registration is not None:
+    # If a meshes are available, render both original and deformed meshes
+    if mesh is not None and registration is not None and deformed_mesh is not None:
+        # Render both meshes
         mesh_surface, mesh_depth = render_mesh(viewpoint_camera, mesh, registration)
-        #debug_mesh(viewpoint_camera, mesh, registration)
+        # Use identity registration for deformed mesh because it was already registered in the Gaussian Model
+        deformed_surface, deformed_depth = render_mesh(viewpoint_camera, deformed_mesh, torch.eye(4))
+        
+        # TODO: Debug rendered outputs; what is the issue here?
+        print("\nRendered outputs stats:")
+        print(f"Original mesh depth range: [{mesh_depth.min()}, {mesh_depth.max()}]")
+        print(f"Deformed mesh depth range: [{deformed_depth.min()}, {deformed_depth.max()}]")
+        
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
-                "depth":depth,
+                "depth": depth,
                 "alpha": alpha.squeeze(0),
                 "semantics": rendered_semantics,
                 "mesh_surface": mesh_surface,
-                "mesh_depth": mesh_depth}
+                "mesh_depth": mesh_depth,
+                "deformed_surface": deformed_surface,
+                "deformed_depth": deformed_depth}
 
     else:
         return {"render": rendered_image,

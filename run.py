@@ -15,9 +15,9 @@ from src.utils.PointTracker import PointTracker, mte, surv_2d, delta_2d
 from src.utils.datasets import StereoMIS, Atlas
 from src.utils.loss_utils import l1_loss
 from src.utils.renderer import render
-from src.scene.gaussian_model import GaussianModel
+from src.scene.gaussian_model import GaussianModel, MeshAwareGaussianModel
 from src.utils.mesh_utils import preprocess_mesh
-from src.utils.transform_utils import SCALE
+from src.utils.transform_utils import SCALE, SWAP_AND_FLIP_WORLD_AXES
 
 # For Depth Anything V2
 import cv2
@@ -44,7 +44,8 @@ class SceneOptimizer():
         # self.frame_reader = StereoMIS(cfg, args, scale=self.scale)
         self.n_img = len(self.frame_reader)
         self.frame_loader = DataLoader(self.frame_reader, batch_size=1, num_workers=0 if args.debug else 4)
-        self.net = GaussianModel(cfg=cfg['model'])
+        # self.net = GaussianModel(cfg=cfg['model'])
+        self.net = MeshAwareGaussianModel(cfg=cfg['model'])
         self.camera = Camera(cfg['cam'])
         self.visualizer = FrameVisualizer(self.output, cfg, self.net)
 
@@ -155,6 +156,23 @@ class SceneOptimizer():
                     self.net.optimizer.step()
                     self.net.optimizer.zero_grad(set_to_none=True)
 
+
+    def get_deformed_mesh(self, mesh, pc):
+        # Get the deformed mesh vertices from the Gaussian model
+        deformed_mesh = mesh.copy()
+        deformed_vertices = pc.mesh_vertices.detach().cpu().numpy()
+
+        # Transform to original mesh space! Bear in mind that those vertices do not come from the original mesh
+        #  but from the optimization in the world space of the Gaussians. Need to apply the same transform
+        #  (actually its inverse) to go back to the original mesh space that this rendering assumes
+        transform = SWAP_AND_FLIP_WORLD_AXES
+        deformed_vertices = (transform[:3, :3] @ deformed_vertices.T).T / SCALE
+        # Ensure array is contiguous and in the correct dtype
+        deformed_vertices = np.ascontiguousarray(deformed_vertices, dtype=np.float32)
+        deformed_mesh.points = deformed_vertices
+        return deformed_mesh
+    
+
     def run(self):
         torch.cuda.empty_cache()
         pt_track_stats = {"pred_2d": []}
@@ -234,9 +252,13 @@ class SceneOptimizer():
                 if self.visualize:
                     # Pass a copy of mesh, will be modified by the visualizer
                     mesh_copy = self.mesh.copy() if self.mesh is not None else None
+                    
+                    # Get the deformed mesh vertices from the Gaussian model
+                    deformed_mesh = self.get_deformed_mesh(mesh_copy, self.net) if self.mesh is not None else None
+
                     outmap, outsem, outrack = self.visualizer.save_imgs(ids.item(), gt_depth, gt_color,
                                                                         gt_c2w, pts_2d, pts_2d_gt, mesh=mesh_copy,
-                                                                        registration=registration)
+                                                                        registration=registration, deformed_mesh=deformed_mesh)
                     if self.log:
                         log_dict.update({'mapping': wandb.Image(outmap),
                                          'tracking': wandb.Image(outrack) if outrack is not None else None,
