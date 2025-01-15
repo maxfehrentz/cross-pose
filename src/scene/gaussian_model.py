@@ -456,8 +456,9 @@ class MeshAwareGaussianModel(GaussianModel):
         self.barycentric_coords = None
         self._xyz = torch.empty(0)
         self.original_mesh_vertices = None
+        self.original_edges = None
         self.neighbors = None
-        self.arap_rotations = None
+        # self.arap_rotations = None
 
     @property
     def get_xyz(self):
@@ -524,12 +525,16 @@ class MeshAwareGaussianModel(GaussianModel):
 
         # Initialize per-vertex ARAP rotations as parameters (as quaternions)
         num_vertices = self.mesh_vertices.shape[0]
-        self.arap_rotations = nn.Parameter(torch.zeros(num_vertices, 4, device='cuda'))
-        # Make identity rotation
-        self.arap_rotations.data[:, 0] = 1.0
         
         print("Precomputing neighbor information...")
         self.padded_neighbors, self.neighbor_mask = self.build_neighbors(faces)
+
+        print("Precomputing original edges...")
+        # Precomputing the original edges, used to regularize and won't change
+        #   Unsqueezing along dim 1 -> (#vertices, broadcasted to #neighbors, 3)
+        #   Indexing with padded neighbors -> (#vertices, #max_neighbors, 3)
+        #   Can then subtract to get all edge vectors, shape (#vertices, #max_neighbors, 3)
+        self.original_edges = self.original_mesh_vertices.unsqueeze(1) - self.original_mesh_vertices[self.padded_neighbors]
 
     def training_setup(self, training_args):
         self.percent_dense = training_args["percent_dense"]
@@ -539,8 +544,6 @@ class MeshAwareGaussianModel(GaussianModel):
 
         l = [
             {'params': [self.mesh_vertices], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "mesh_vertices"},
-            # TODO: give arap rotations its own lr?
-            {'params': [self.arap_rotations], 'lr': training_args["rotation_lr"], "name": "arap_rotations"},
             # {'params': [self._xyz], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "xyz"},
             # {'params': [self.barycentric_coords], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "barycentric"},
             {'params': [self._features_dc], 'lr': training_args["feature_lr"], "name": "f_dc"},
@@ -557,6 +560,8 @@ class MeshAwareGaussianModel(GaussianModel):
         v0 = self.mesh_vertices[self.mesh_faces[:, 0]]
         v1 = self.mesh_vertices[self.mesh_faces[:, 1]]
         v2 = self.mesh_vertices[self.mesh_faces[:, 2]]
+
+        # TODO: return to this when inhertiance strategy is implemented and parametrize with barycentric coords
 
         # Compute triangle centers as position for each Gaussian
         positions = ((v0 + v1 + v2) / 3.0)
@@ -575,20 +580,43 @@ class MeshAwareGaussianModel(GaussianModel):
         return xyz, scales, rots, opacity, self.get_features, self.get_semantics
         
     def compute_arap_energy(self):
-        # Convert ARAP rotations to matrices
-        rot_matrices = build_rotation(self.arap_rotations)
-        
-        # Get current and previous positions
+        # Get current positions and compute current edges
         curr_pos = self.mesh_vertices
-        prev_pos = self.original_mesh_vertices
-        
+
         # Compute all edges at once using broadcasting and precomputed padded neighbors
-        # Unsqueezing along dim 1 -> (#vertices, broadcasted to #neighbors, 3)
-        # Indexing with padded neighbors -> (#vertices, #max_neighbors, 3)
-        # Can then subtract to get all edge vectors, shape (#vertices, #max_neighbors, 3)
+        #   Unsqueezing along dim 1 -> (#vertices, broadcasted to #neighbors, 3)
+        #   Indexing with padded neighbors -> (#vertices, #max_neighbors, 3)
+        #   Can then subtract to get all edge vectors, shape (#vertices, #max_neighbors, 3)
         curr_edges = curr_pos.unsqueeze(1) - curr_pos[self.padded_neighbors]
-        # TODO: optimize this by precomputing it; this is based on the original mesh and won't change
-        prev_edges = prev_pos.unsqueeze(1) - prev_pos[self.padded_neighbors]
+        
+        # Compute covariance matrices for each vertex (Si in the original ARAP paper), assuming uniform weights
+        #   Have to transpose the original edges because contrary to the the paper, our edges are stored as rows, not columns 
+        covariance_matrices = torch.matmul(
+            self.original_edges.transpose(2, 1),  # [#vertices, 3, #max_neighbors]
+            curr_edges  # [#vertices, #max_neighbors, 3]
+        )  # [#vertices, 3, 3]
+
+        # TODO: return to this with non-uniform weights at some point, maybe based on visibility criterion, difference in rendered and relative depth map, ...
+        
+        # Compute optimal rotations using SVD
+        U, _, V = torch.svd(covariance_matrices)
+        
+        # Compute rotation matrices Ri = V * U^T
+        rot_matrices = torch.matmul(V, U.transpose(2, 1))  # [N, 3, 3]
+        
+        # Handle reflection case by ensuring det(Ri) > 0
+        dets = torch.linalg.det(rot_matrices)
+        
+        # Create reflection matrix diag(1,1,-1)
+        reflection_matrix = torch.eye(3, device='cuda').unsqueeze(0)
+        reflection_matrix[:, 2, 2] = -1
+        
+        # Apply reflection where det < 0
+        rot_matrices = torch.where(
+            dets.unsqueeze(-1).unsqueeze(-1) < 0,
+            torch.matmul(rot_matrices, reflection_matrix),
+            rot_matrices
+        )
         
         # Apply rotations to all edges at once using batch matrix multiplication
         # Unsqueezing rotations along dim 1 -> (#vertices, 1, 3, 3) again so that we can broadcast along dim 1
@@ -597,7 +625,7 @@ class MeshAwareGaussianModel(GaussianModel):
         # Removing the superfluous last dim gives us the rotated edges (#vertices, #max_neighbors, 3)
         rotated_edges = torch.matmul(
             rot_matrices.unsqueeze(1),
-            prev_edges.unsqueeze(-1)
+            self.original_edges.unsqueeze(-1)
         ).squeeze(-1)
         
         # Compute differences and apply precomputed mask
@@ -606,7 +634,6 @@ class MeshAwareGaussianModel(GaussianModel):
         squared_diff = torch.sum(edge_diff * edge_diff, dim=-1)
         # Apply mask to zero out padded entries
         masked_diff = squared_diff * self.neighbor_mask
-        
         # Sum up all contributions
         arap_energy = masked_diff.sum()
         
