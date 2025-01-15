@@ -2,7 +2,7 @@ inherit_from: configs/base.yaml
 device: cuda
 scale: null # Specified in a utils file with other transformations instead of here
 dataset: 'ATLAS'
-mesh: /home/fsc/max/Data/Pigs/ImFusionExport_abdominal_cavity_high_res.obj
+mesh: /home/fsc/max/Data/Pigs/ImFusionExport_abdominal_cavity_coarse.obj
 cam:
   H: 540
   W: 960
@@ -19,6 +19,8 @@ training:
   optical_flow_init: False
   w_depth: 10 # default: 10
   w_color: 5 # default: 5
+  w_def:
+    w_arap: 0.01
 
   iters: 200 # default: 100
   iters_first: 1000 # default: 1000

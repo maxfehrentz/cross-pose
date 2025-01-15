@@ -116,38 +116,43 @@ class SceneOptimizer():
             #loss = Ll1 + Ll1_depth
             loss = Ll1
 
-            if incremental:
+            # If we are using the mesh aware net, we only receive an ARAP energy term
+            if isinstance(self.net, MeshAwareGaussianModel):
+                # TODO: add more regularization terms here and use visibility somehow
+                l_arap = self.net.compute_regulation(render_pkg["visibility_filter"])
+                loss += self.cfg['training']['w_def']['w_arap'] * l_arap
+            else:
                 l_rigidtrans, l_rigidrot, l_iso, l_visible = self.net.compute_regulation(render_pkg["visibility_filter"])
                 def_loss = self.cfg['training']['w_def']['rigid']*l_rigidtrans + self.cfg['training']['w_def']['iso']*l_iso+ self.cfg['training']['w_def']['rot']*l_rigidrot+ self.cfg['training']['w_def']['nvisible']*l_visible
                 loss += def_loss
-            else:
-                l_rigidtrans, l_rigidrot, l_iso, l_visible = torch.zeros_like(Ll1), torch.zeros_like(Ll1), torch.zeros_like(Ll1), torch.zeros_like(Ll1)
+            
             loss.backward()
             viewspace_point_tensor_grad = torch.zeros_like(render_pkg["viewspace_points"])
             viewspace_point_tensor_grad += render_pkg["viewspace_points"].grad
 
             ########### Logging & Evaluation ###################
             with torch.no_grad():
-                av_loss[0] += Ll1.item()
-                av_loss[1] += Ll1_depth.item()
-                av_loss[2] += l_rigidtrans.item()
-                av_loss[3] += l_rigidrot.item()
-                av_loss[4] += l_iso.item()
-                av_loss[5] += l_visible.item()
-                av_loss[-1] += 1
-                if ((self.total_iters % self.log_freq) == 0) and self.log:
-                    wandb.log({'color_loss': av_loss[0] / av_loss[-1],
-                               'depth_loss': av_loss[1] / av_loss[-1],
-                               'rigidtrans_loss': av_loss[2] / av_loss[-1],
-                               'rigidrot_loss': av_loss[3] / av_loss[-1],
-                               'iso_loss': av_loss[4] / av_loss[-1],
-                               'visible_loss': av_loss[5] / av_loss[-1],
-                               'loss': sum(av_loss[:-1]) / av_loss[-1]}, step=self.total_iters)
-                    av_loss = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
+                # av_loss[0] += Ll1.item()
+                # av_loss[1] += Ll1_depth.item()
+                # av_loss[2] += l_rigidtrans.item()
+                # av_loss[3] += l_rigidrot.item()
+                # av_loss[4] += l_iso.item()
+                # av_loss[5] += l_visible.item()
+                # av_loss[-1] += 1
+                # if ((self.total_iters % self.log_freq) == 0) and self.log:
+                #     wandb.log({'color_loss': av_loss[0] / av_loss[-1],
+                #                'depth_loss': av_loss[1] / av_loss[-1],
+                #                'rigidtrans_loss': av_loss[2] / av_loss[-1],
+                #                'rigidrot_loss': av_loss[3] / av_loss[-1],
+                #                'iso_loss': av_loss[4] / av_loss[-1],
+                #                'visible_loss': av_loss[5] / av_loss[-1],
+                #                'loss': sum(av_loss[:-1]) / av_loss[-1]}, step=self.total_iters)
+                #     av_loss = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
 
-                self.net.add_densification_stats(viewspace_point_tensor_grad, render_pkg["visibility_filter"])
+                # self.net.add_densification_stats(viewspace_point_tensor_grad, render_pkg["visibility_filter"])
 
                 # Densification
+                # TODO: implement this in the mesh aware model
                 if iter > self.cfg["training"]["densify_from_iter"] and iter % self.cfg["training"]["densification_interval"] == 0:
                     self.net.densify(self.cfg["training"]["densify_grad_threshold"])
 

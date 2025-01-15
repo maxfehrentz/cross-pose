@@ -10,6 +10,7 @@ from src.scene.deformation import ExplicitDeformation, ExplicitSparseDeformation
 from src.utils.flow_utils import get_surface_pts
 from functools import partial
 from vtk.util.numpy_support import vtk_to_numpy
+import os
 
 
 class GaussianModel(nn.Module):
@@ -454,6 +455,9 @@ class MeshAwareGaussianModel(GaussianModel):
         self.mesh_faces = None
         self.barycentric_coords = None
         self._xyz = torch.empty(0)
+        self.original_mesh_vertices = None
+        self.neighbors = None
+        self.arap_rotations = None
 
     @property
     def get_xyz(self):
@@ -478,6 +482,7 @@ class MeshAwareGaussianModel(GaussianModel):
         
         # Make vertices optimizable parameters
         self.mesh_vertices = nn.Parameter(vertices.requires_grad_(True))
+        self.original_mesh_vertices = vertices.detach().clone()
         # Topology is constant
         n_triangles = faces.shape[0]
         self.mesh_faces = faces
@@ -517,6 +522,15 @@ class MeshAwareGaussianModel(GaussianModel):
         # Initialize semantics if needed
         self._semantics = torch.ones((*depth.shape, self.n_classes), device="cuda").squeeze(0)
 
+        # Initialize per-vertex ARAP rotations as parameters (as quaternions)
+        num_vertices = self.mesh_vertices.shape[0]
+        self.arap_rotations = nn.Parameter(torch.zeros(num_vertices, 4, device='cuda'))
+        # Make identity rotation
+        self.arap_rotations.data[:, 0] = 1.0
+        
+        print("Precomputing neighbor information...")
+        self.padded_neighbors, self.neighbor_mask = self.build_neighbors(faces)
+
     def training_setup(self, training_args):
         self.percent_dense = training_args["percent_dense"]
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -525,9 +539,10 @@ class MeshAwareGaussianModel(GaussianModel):
 
         l = [
             {'params': [self.mesh_vertices], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "mesh_vertices"},
+            # TODO: give arap rotations its own lr?
+            {'params': [self.arap_rotations], 'lr': training_args["rotation_lr"], "name": "arap_rotations"},
             # {'params': [self._xyz], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "xyz"},
             # {'params': [self.barycentric_coords], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "barycentric"},
-            # {'params': [self.normal_offsets], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "offsets"},
             {'params': [self._features_dc], 'lr': training_args["feature_lr"], "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args["feature_lr"] / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args["opacity_lr"], "name": "opacity"},
@@ -545,20 +560,105 @@ class MeshAwareGaussianModel(GaussianModel):
 
         # Compute triangle centers as position for each Gaussian
         positions = ((v0 + v1 + v2) / 3.0)
-
         return positions
         
     def forward(self, deform=True):
         # TODO: not sure why this yields so much better results, come back to this
         # Disable gradient for scaling
         self._scaling.requires_grad_(False)
-        
         # Compute Gaussian positions from mesh and parameters
         xyz = self.compute_positions()
-        
         # Apply scaling, rotation, etc. as before
         scales = self.scaling_activation(self._scaling)
         rots = self.rotation_activation(self._rotation)
         opacity = self.opacity_activation(self._opacity)
-        
         return xyz, scales, rots, opacity, self.get_features, self.get_semantics
+        
+    def compute_arap_energy(self):
+        # Convert ARAP rotations to matrices
+        rot_matrices = build_rotation(self.arap_rotations)
+        
+        # Get current and previous positions
+        curr_pos = self.mesh_vertices
+        prev_pos = self.original_mesh_vertices
+        
+        # Compute all edges at once using broadcasting and precomputed padded neighbors
+        # Unsqueezing along dim 1 -> (#vertices, broadcasted to #neighbors, 3)
+        # Indexing with padded neighbors -> (#vertices, #max_neighbors, 3)
+        # Can then subtract to get all edge vectors, shape (#vertices, #max_neighbors, 3)
+        curr_edges = curr_pos.unsqueeze(1) - curr_pos[self.padded_neighbors]
+        # TODO: optimize this by precomputing it; this is based on the original mesh and won't change
+        prev_edges = prev_pos.unsqueeze(1) - prev_pos[self.padded_neighbors]
+        
+        # Apply rotations to all edges at once using batch matrix multiplication
+        # Unsqueezing rotations along dim 1 -> (#vertices, 1, 3, 3) again so that we can broadcast along dim 1
+        # Unsqueezing prev_edges along dim -1 -> (#vertices, #max_neighbors, 3, 1)
+        # Then matmul will broadcast the rotations to (#vertices, #max_neighbors, 3, 3) and we can matmul to get (#vertices, #max_neighbors, 3, 1)
+        # Removing the superfluous last dim gives us the rotated edges (#vertices, #max_neighbors, 3)
+        rotated_edges = torch.matmul(
+            rot_matrices.unsqueeze(1),
+            prev_edges.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        # Compute differences and apply precomputed mask
+        edge_diff = curr_edges - rotated_edges
+        # Summing over the last dim gives us the l2 norm squared for each edge, shaped (#vertices, #max_neighbors)
+        squared_diff = torch.sum(edge_diff * edge_diff, dim=-1)
+        # Apply mask to zero out padded entries
+        masked_diff = squared_diff * self.neighbor_mask
+        
+        # Sum up all contributions
+        arap_energy = masked_diff.sum()
+        
+        return arap_energy
+
+    def compute_regulation(self, visibility_filter):
+        arap_energy = self.compute_arap_energy()
+        return arap_energy
+
+    def build_neighbors(self, faces):
+        # Load torch tensors from a file if they exist
+        # TODO: hack to debug faster, remove later
+        if os.path.exists("padded_neighbors.pt") and os.path.exists("neighbor_mask.pt"):
+            print("Loading padded_neighbors and neighbor_mask from file")
+            padded_neighbors = torch.load("padded_neighbors.pt")
+            neighbor_mask = torch.load("neighbor_mask.pt")
+            return padded_neighbors, neighbor_mask
+        
+        num_vertices = self.mesh_vertices.shape[0]
+        
+        # Create adjacency lists
+        adjacency = [[] for _ in range(num_vertices)]
+        
+        # Each face is [v0, v1, v2]. Add edges both ways.
+        for f in faces:
+            v0, v1, v2 = f
+            adjacency[v0].append(v1)
+            adjacency[v0].append(v2)
+            adjacency[v1].append(v0)
+            adjacency[v1].append(v2)
+            adjacency[v2].append(v0)
+            adjacency[v2].append(v1)
+        
+        # Remove duplicates
+        for i in range(num_vertices):
+            adjacency[i] = list(set(adjacency[i]))
+        
+        # Build padded neighbor arrays
+        max_neighbors = max(len(n) for n in adjacency)
+        padded_neighbors = torch.full((num_vertices, max_neighbors), -1, device='cuda', dtype=torch.long)
+        neighbor_mask = torch.zeros((num_vertices, max_neighbors), device='cuda', dtype=torch.bool)
+        
+        for i in range(num_vertices):
+            n_list = adjacency[i]
+            padded_neighbors[i, :len(n_list)] = torch.tensor(n_list, device='cuda', dtype=torch.long)
+            neighbor_mask[i, :len(n_list)] = True
+
+        # Save torch tensors to a file
+        print("Saving padded_neighbors and neighbor_mask to file")
+        torch.save(padded_neighbors, "padded_neighbors.pt")
+        torch.save(neighbor_mask, "neighbor_mask.pt")
+        
+        return padded_neighbors, neighbor_mask
+
+

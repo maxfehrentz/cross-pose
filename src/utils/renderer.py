@@ -206,11 +206,6 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, mesh =
         # Use identity registration for deformed mesh because it was already registered in the Gaussian Model
         deformed_surface, deformed_depth = render_mesh(viewpoint_camera, deformed_mesh, torch.eye(4))
         
-        # TODO: Debug rendered outputs; what is the issue here?
-        print("\nRendered outputs stats:")
-        print(f"Original mesh depth range: [{mesh_depth.min()}, {mesh_depth.max()}]")
-        print(f"Deformed mesh depth range: [{deformed_depth.min()}, {deformed_depth.max()}]")
-        
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
