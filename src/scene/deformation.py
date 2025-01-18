@@ -229,3 +229,49 @@ class ExplicitSparseDeformation(ExplicitDeformation):
         deformation = (weights[..., None] * deformation).sum(1) / weight_sum[..., None]
         deformation[weight_sum < 0.1] = 0.0
         self.means_def += deformation[self.anchor_ids].clamp(-0.01, 0.01).float()
+
+
+class MeshSparseDeformation(nn.Module):
+    def __init__(self, vertices, subsample: int=64):
+        super().__init__()
+        self.subsample = subsample
+        
+        # Initialize control vertices
+        n_vertices = vertices.shape[0]
+        control_ids = np.random.permutation(np.arange(n_vertices))[::self.subsample]
+        self.control_ids = torch.tensor(control_ids, device='cuda')
+        
+        # Initialize deformation parameters for control vertices
+        self.control_def = torch.nn.Parameter(torch.zeros(len(self.control_ids), 3, device='cuda'))
+        
+        tree = KDTree(vertices[self.control_ids].detach().cpu().numpy())
+
+        # TODO: come back to k and eps
+        # Yields the k-nearest control points for each vertex, shape [n_vertices, k]
+        neighbour_dists, neighbours = tree.query(vertices.detach().cpu().numpy(), k=20)
+
+        self.neighbour_dists = torch.tensor(neighbour_dists, device="cuda", dtype=torch.float32)
+        self.neighbours = torch.tensor(neighbours, device="cuda")
+        self.neighbour_weights = torch.exp(-4.5*(self.neighbour_dists))
+        # Yields a sum of shape [n_vertices, 1]
+        self.neighbour_weights_sum = self.neighbour_weights.sum(dim=-1).clamp(1e-2)
+
+    def interpolate(self):
+        """
+        Fast approximation using pre-computed weights of k-most important neighbors
+        """
+        assert self.control_def.shape[0] > self.neighbours.max()
+        # neighbors is [n_vertices, k_neighbors], indexing into control_def -> [n_vertices, k_neighbors, 3]
+        # self.neighbour_weights is [n_vertices, k_neighbors], adding a dimension for broadcasting
+        # Then summing over dim=1 -> [n_vertices, 1, 3]
+        # Dividing by self.neighbour_weights_sum of shape [n_vertices, 1] with added last dim for broadcast
+        # Gives final shape [n_vertices, 3]
+        vertices_def = (self.neighbour_weights[...,None] * self.control_def[self.neighbours]).sum(dim=1) / self.neighbour_weights_sum[...,None]
+        return vertices_def
+
+    def forward(self, vertices):
+        """Compute deformed vertex positions"""
+        vertices_def = self.interpolate()
+        vertices_deformed = vertices + vertices_def
+        return vertices_deformed
+        

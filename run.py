@@ -165,7 +165,7 @@ class SceneOptimizer():
     def get_deformed_mesh(self, mesh, pc):
         # Get the deformed mesh vertices from the Gaussian model
         deformed_mesh = mesh.copy()
-        deformed_vertices = pc.mesh_vertices.detach().cpu().numpy()
+        deformed_vertices = pc.get_mesh_vertices.detach().cpu().numpy()
 
         # Transform to original mesh space! Bear in mind that those vertices do not come from the original mesh
         #  but from the optimization in the world space of the Gaussians. Need to apply the same transform
@@ -175,6 +175,15 @@ class SceneOptimizer():
         # Ensure array is contiguous and in the correct dtype
         deformed_vertices = np.ascontiguousarray(deformed_vertices, dtype=np.float32)
         deformed_mesh.points = deformed_vertices
+
+        # Have to recompute normals after changing the vertex positions
+        deformed_mesh.compute_normals(
+            cell_normals=False,
+            point_normals=True,
+            split_vertices=True,  # Crucial here, otherwise normals are not computed correctly
+            inplace=True
+        )
+
         return deformed_mesh
     
 
@@ -258,7 +267,7 @@ class SceneOptimizer():
                     # Pass a copy of mesh, will be modified by the visualizer
                     mesh_copy = self.mesh.copy() if self.mesh is not None else None
                     
-                    # Get the deformed mesh vertices from the Gaussian model
+                    # Get the deformed mesh from the Gaussian model
                     deformed_mesh = self.get_deformed_mesh(mesh_copy, self.net) if self.mesh is not None else None
 
                     outmap, outsem, outrack = self.visualizer.save_imgs(ids.item(), gt_depth, gt_color,

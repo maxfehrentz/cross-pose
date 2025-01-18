@@ -6,7 +6,7 @@ from src.utils.mesh_utils import register_mesh
 from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES, SCALE
 from simple_knn._C import distCUDA2
 from src.utils.general_utils import strip_symmetric, build_scaling_rotation, build_inv_cov, inverse_sigmoid, build_rotation
-from src.scene.deformation import ExplicitDeformation, ExplicitSparseDeformation
+from src.scene.deformation import ExplicitDeformation, ExplicitSparseDeformation, MeshSparseDeformation
 from src.utils.flow_utils import get_surface_pts
 from functools import partial
 from vtk.util.numpy_support import vtk_to_numpy
@@ -451,18 +451,22 @@ class GaussianModel(nn.Module):
 class MeshAwareGaussianModel(GaussianModel):
     def __init__(self, cfg, n_classes=7):
         super().__init__(cfg, n_classes)
-        self.mesh_vertices = None
+        self.current_mesh_vertices = None
         self.mesh_faces = None
         self.barycentric_coords = None
         self._xyz = torch.empty(0)
         self.original_mesh_vertices = None
         self.original_edges = None
         self.neighbors = None
-        # self.arap_rotations = None
+        self.mesh_deformation = None
 
     @property
     def get_xyz(self):
         return self._xyz
+    
+    @property
+    def get_mesh_vertices(self):
+        return self.current_mesh_vertices
         
     def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0):
         self.spatial_lr_scale = spatial_lr_scale
@@ -481,9 +485,9 @@ class MeshAwareGaussianModel(GaussianModel):
         face_array = triangle_cells.GetData()
         faces = torch.tensor(vtk_to_numpy(face_array).reshape(-1, 4)[:, 1:], dtype=torch.int64).cuda()
         
-        # Make vertices optimizable parameters
-        self.mesh_vertices = nn.Parameter(vertices.requires_grad_(True))
-        self.original_mesh_vertices = vertices.detach().clone()
+        # Keep track of current vertices and original vertices
+        self.current_mesh_vertices = vertices
+        self.original_mesh_vertices = vertices
         # Topology is constant
         n_triangles = faces.shape[0]
         self.mesh_faces = faces
@@ -493,7 +497,8 @@ class MeshAwareGaussianModel(GaussianModel):
         #     n_triangles, 3).cuda() / 3.0)   
         self.barycentric_coords = torch.ones(n_triangles, 3).cuda() / 3.0
 
-        xyz = self.compute_positions()
+        # Compute initial positions, no deformation yet
+        xyz = self.compute_positions(deform=False)
 
         # TODO: remove later if possible, super hacky; for some reason, just allocating a dummy tensor fixes the illegal memory access issues?? memory alignment issue?
         dummy_tensor = torch.zeros((xyz.shape[0], 3), dtype=torch.float32, device="cuda")
@@ -523,8 +528,6 @@ class MeshAwareGaussianModel(GaussianModel):
         # Initialize semantics if needed
         self._semantics = torch.ones((*depth.shape, self.n_classes), device="cuda").squeeze(0)
 
-        # Initialize per-vertex ARAP rotations as parameters (as quaternions)
-        num_vertices = self.mesh_vertices.shape[0]
         
         print("Precomputing neighbor information...")
         self.padded_neighbors, self.neighbor_mask = self.build_neighbors(faces)
@@ -536,6 +539,9 @@ class MeshAwareGaussianModel(GaussianModel):
         #   Can then subtract to get all edge vectors, shape (#vertices, #max_neighbors, 3)
         self.original_edges = self.original_mesh_vertices.unsqueeze(1) - self.original_mesh_vertices[self.padded_neighbors]
 
+        # Initialize mesh deformation
+        self.mesh_deformation = MeshSparseDeformation(self.original_mesh_vertices, subsample=64)
+
     def training_setup(self, training_args):
         self.percent_dense = training_args["percent_dense"]
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -543,9 +549,7 @@ class MeshAwareGaussianModel(GaussianModel):
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
-            {'params': [self.mesh_vertices], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "mesh_vertices"},
-            # {'params': [self._xyz], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "xyz"},
-            # {'params': [self.barycentric_coords], 'lr': training_args["position_lr_init"] * self.spatial_lr_scale, "name": "barycentric"},
+            {'params': self.mesh_deformation.parameters(), 'lr': training_args["deformation_lr_init"] * self.spatial_lr_scale, "name": "deformation"},
             {'params': [self._features_dc], 'lr': training_args["feature_lr"], "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args["feature_lr"] / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args["opacity_lr"], "name": "opacity"},
@@ -555,24 +559,25 @@ class MeshAwareGaussianModel(GaussianModel):
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         
-    def compute_positions(self):          
+    def compute_positions(self, deform):
+        if deform:
+            vertices = self.mesh_deformation(self.original_mesh_vertices)
+            self.current_mesh_vertices = vertices
+        else:
+            vertices = self.current_mesh_vertices
+        
         # Get vertices for each triangle face
-        v0 = self.mesh_vertices[self.mesh_faces[:, 0]]
-        v1 = self.mesh_vertices[self.mesh_faces[:, 1]]
-        v2 = self.mesh_vertices[self.mesh_faces[:, 2]]
-
-        # TODO: return to this when inhertiance strategy is implemented and parametrize with barycentric coords
+        v0 = vertices[self.mesh_faces[:, 0]]
+        v1 = vertices[self.mesh_faces[:, 1]]
+        v2 = vertices[self.mesh_faces[:, 2]]
 
         # Compute triangle centers as position for each Gaussian
         positions = ((v0 + v1 + v2) / 3.0)
         return positions
         
     def forward(self, deform=True):
-        # TODO: not sure why this yields so much better results, come back to this
-        # Disable gradient for scaling
-        self._scaling.requires_grad_(False)
         # Compute Gaussian positions from mesh and parameters
-        xyz = self.compute_positions()
+        xyz = self.compute_positions(deform)
         # Apply scaling, rotation, etc. as before
         scales = self.scaling_activation(self._scaling)
         rots = self.rotation_activation(self._rotation)
@@ -580,8 +585,7 @@ class MeshAwareGaussianModel(GaussianModel):
         return xyz, scales, rots, opacity, self.get_features, self.get_semantics
         
     def compute_arap_energy(self):
-        # Get current positions and compute current edges
-        curr_pos = self.mesh_vertices
+        curr_pos = self.mesh_deformation(self.original_mesh_vertices)
 
         # Compute all edges at once using broadcasting and precomputed padded neighbors
         #   Unsqueezing along dim 1 -> (#vertices, broadcasted to #neighbors, 3)
@@ -652,7 +656,7 @@ class MeshAwareGaussianModel(GaussianModel):
             neighbor_mask = torch.load("neighbor_mask.pt")
             return padded_neighbors, neighbor_mask
         
-        num_vertices = self.mesh_vertices.shape[0]
+        num_vertices = self.current_mesh_vertices.shape[0]
         
         # Create adjacency lists
         adjacency = [[] for _ in range(num_vertices)]
