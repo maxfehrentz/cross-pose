@@ -498,7 +498,7 @@ class MeshAwareGaussianModel(GaussianModel):
         self.barycentric_coords = torch.ones(n_triangles, 3).cuda() / 3.0
 
         # Compute initial positions, no deformation yet
-        xyz = self.compute_positions(deform=False)
+        xyz, _ = self.compute_positions_and_normals(deform=False)
 
         # TODO: remove later if possible, super hacky; for some reason, just allocating a dummy tensor fixes the illegal memory access issues?? memory alignment issue?
         dummy_tensor = torch.zeros((xyz.shape[0], 3), dtype=torch.float32, device="cuda")
@@ -522,7 +522,6 @@ class MeshAwareGaussianModel(GaussianModel):
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
-        self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         
         # Initialize semantics if needed
@@ -554,12 +553,11 @@ class MeshAwareGaussianModel(GaussianModel):
             {'params': [self._features_rest], 'lr': training_args["feature_lr"] / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args["opacity_lr"], "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args["scaling_lr"], "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args["rotation_lr"], "name": "rotation"}
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         
-    def compute_positions(self, deform):
+    def compute_positions_and_normals(self, deform):
         if deform:
             vertices = self.mesh_deformation(self.original_mesh_vertices)
             self.current_mesh_vertices = vertices
@@ -573,14 +571,49 @@ class MeshAwareGaussianModel(GaussianModel):
 
         # Compute triangle centers as position for each Gaussian
         positions = ((v0 + v1 + v2) / 3.0)
-        return positions
+
+        # Compute face normals
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        face_normals = torch.linalg.cross(edge1, edge2, dim=1)
+        face_normals = torch.nn.functional.normalize(face_normals, dim=1)
+        
+        return positions, face_normals
+    
+    def compute_rotations_from_normals(self, normals):
+        # Reference direction (z-axis)
+        z_axis = torch.tensor([0.0, 0.0, 1.0], device=normals.device)
+        
+        # Compute rotation axis (cross product)
+        rotation_axis = torch.linalg.cross(z_axis.expand_as(normals), normals)
+        
+        # Handle case where normal is parallel to z-axis; x-axis is used as fallback
+        # TODO: make sure this does not cause bugs, not sure about x-axis fallback
+        parallel_mask = torch.norm(rotation_axis, dim=1) < 1e-6
+        rotation_axis[parallel_mask] = torch.tensor([1.0, 0.0, 0.0], device=normals.device)
+
+        # Normalize rotation axis
+        rotation_axis = torch.nn.functional.normalize(rotation_axis, dim=1)
+        
+        # Compute rotation angle; cos(angle) is the dot product between normals and z-axis, acos retrieves angle in radians
+        cos_angle = torch.sum(normals * z_axis.expand_as(normals), dim=1)
+        angle = torch.acos(torch.clamp(cos_angle, -1.0, 1.0))
+        
+        # Convert to quaternion (w, x, y, z format) where  q = (w, x, y, z) = (cos(θ/2), axsin(θ/2), aysin(θ/2), azsin(θ/2)) with ax, ay, az being the rotation axis
+        sin_half_angle = torch.sin(angle/2)[:, None]
+        cos_half_angle = torch.cos(angle/2)[:, None]
+        quat = torch.cat([
+            cos_half_angle,  # w component first
+            rotation_axis * sin_half_angle  # xyz components
+        ], dim=1)
+        
+        return quat
         
     def forward(self, deform=True):
         # Compute Gaussian positions from mesh and parameters
-        xyz = self.compute_positions(deform)
-        # Apply scaling, rotation, etc. as before
+        xyz, normals = self.compute_positions_and_normals(deform)
+        rots = self.rotation_activation(self.compute_rotations_from_normals(normals))
         scales = self.scaling_activation(self._scaling)
-        rots = self.rotation_activation(self._rotation)
         opacity = self.opacity_activation(self._opacity)
         return xyz, scales, rots, opacity, self.get_features, self.get_semantics
         
