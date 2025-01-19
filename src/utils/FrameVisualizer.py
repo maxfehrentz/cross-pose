@@ -78,7 +78,8 @@ class FrameVisualizer(object):
         else:
             fig, axs = plt.subplots(2, 3)
 
-        max_depth = np.max(gt_depth_np)
+        # TODO: change later, only for debugging
+        max_depth = np.max(depth_np)
 
         axs[0, 0].imshow(gt_depth_np, vmin=0, vmax=max_depth)
         axs[0, 0].set_title('Input Depth')
