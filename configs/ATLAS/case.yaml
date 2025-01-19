@@ -21,8 +21,9 @@ training:
   w_color: 5 # default: 5
   w_def:
     w_arap: 0.01
+  feature_lr: 0.0025 # default: 0.0025
 
-  iters: 200 # default: 100
+  iters: 100 # default: 100
   iters_first: 1000 # default: 1000
 
   # TODO: change later when having implemented mesh-based densification

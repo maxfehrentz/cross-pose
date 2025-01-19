@@ -25,9 +25,11 @@ import sys
 sys.path.append('Depth-Anything-V2')
 from metric_depth.depth_anything_v2.dpt import DepthAnythingV2
 
-
 # For the preoperative CT
 import pyvista as pv
+
+# For benchmarking
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 class SceneOptimizer():
@@ -58,13 +60,14 @@ class SceneOptimizer():
             wandb.init(id=self.run_id, name=args.log, config=log_cfg, project='gtracker', group=args.log_group)
         self.background = torch.tensor([0,0,0], dtype=torch.float32, device="cuda")
         self.dbg = args.debug
+
         self.pt_tracker = None
-        track_file = os.path.join(cfg['data']['input_folder'], 'track_pts.pckl')
-        if os.path.isfile(track_file):
-            self.pt_tracker = PointTracker(cfg, self.net, track_file)
-        self.last_frame = None
-        self.raft = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(self.device)
-        self.raft = self.raft.eval()
+        # track_file = os.path.join(cfg['data']['input_folder'], 'track_pts.pckl')
+        # if os.path.isfile(track_file):
+        #     self.pt_tracker = PointTracker(cfg, self.net, track_file)
+        # self.last_frame = None
+        # self.raft = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(self.device)
+        # self.raft = self.raft.eval()
 
         # Checking for baseline, not available if monocular dataset
         self.baseline = cfg['cam'].get('stereo_baseline', None)
@@ -79,87 +82,110 @@ class SceneOptimizer():
             # Preprocesses mesh in place
             preprocess_mesh(self.mesh)
 
-        # Initialize Depth Anything V2 model; using metric depth estimation as described here
-        # https://github.com/DepthAnything/Depth-Anything-V2/tree/main/metric_depth
-        model_configs = {
-            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-        }
-        encoder = 'vitl'
-        dataset = 'hypersim' # 'hypersim' or 'vkitti
-        # TODO: document the "scaling factor" max depth in the Readme if this is used in the end
-        self.depth_anything = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': .2})
-        self.depth_anything.load_state_dict(torch.load(f'Depth-Anything-V2/checkpoints/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
-        self.depth_anything = self.depth_anything.to(self.device).eval()
-
+        # # Initialize Depth Anything V2 model; using metric depth estimation as described here
+        # # https://github.com/DepthAnything/Depth-Anything-V2/tree/main/metric_depth
+        # model_configs = {
+        #     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+        #     'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+        #     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+        # }
+        # encoder = 'vitl'
+        # dataset = 'hypersim' # 'hypersim' or 'vkitti
+        # # TODO: document the "scaling factor" max depth in the Readme if this is used in the end
+        # self.depth_anything = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': .2})
+        # self.depth_anything.load_state_dict(torch.load(f'Depth-Anything-V2/checkpoints/depth_anything_v2_metric_{dataset}_{encoder}.pth', map_location='cpu'))
+        # self.depth_anything = self.depth_anything.to(self.device).eval()
 
     def fit(self, frame, iters, incremental):
-        self.net.reset_optimizer()
-        av_loss = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
-        idx, gt_color, gt_depth, gt_c2w, tool_mask = frame
-        self.camera.set_c2w(gt_c2w)
-        for iter in range(1, iters+1):
-            if self.cfg['training']['spherical_harmonics'] and iter > iters/2:
-                self.net.enable_spherical_harmonics()
-            self.total_iters += 1
-            self.net.train(iter == 1)
-            render_pkg = render(self.camera, self.net, self.background, deform=incremental)
-            self.net.eval()
-            color = render_pkg['render'][None, ...]
-            depth = render_pkg['depth'][None, ...]
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA, ProfilerActivity.XPU]) as prof:
+            self.net.reset_optimizer()
+            av_loss = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
+            idx, gt_color, gt_depth, gt_c2w, tool_mask = frame
+            self.camera.set_c2w(gt_c2w)
+            for iter in range(1, iters+1):
+                if self.cfg['training']['spherical_harmonics'] and iter > iters/2:
+                    self.net.enable_spherical_harmonics()
+                self.total_iters += 1
+                self.net.train(iter == 1)
+                
+                with record_function("render"):
+                    render_pkg = render(self.camera, self.net, self.background, deform=incremental)
+                self.net.eval()
+                color = render_pkg['render'][None, ...]
+                depth = render_pkg['depth'][None, ...]
 
-            # Loss
-            Ll1 = self.cfg['training']['w_color']*l1_loss(color[tool_mask], gt_color[tool_mask])
-            Ll1_depth = self.cfg['training']['w_depth']*l1_loss(depth[tool_mask]/self.scale, gt_depth[tool_mask]/self.scale)
-            # TODO: depth loss taken out for now, come back to this
-            #loss = Ll1 + Ll1_depth
-            loss = Ll1
+                # Loss
+                with record_function("photometric loss computation"):
+                    Ll1 = self.cfg['training']['w_color']*l1_loss(color[tool_mask], gt_color[tool_mask])
+                    # Ll1_depth = self.cfg['training']['w_depth']*l1_loss(depth[tool_mask]/self.scale, gt_depth[tool_mask]/self.scale)
+                # TODO: depth loss taken out for now, come back to this
+                #loss = Ll1 + Ll1_depth
+                loss = Ll1
 
-            # If we are using the mesh aware net, we only receive an ARAP energy term
-            if isinstance(self.net, MeshAwareGaussianModel):
-                # TODO: add more regularization terms here and use visibility somehow
-                l_arap = self.net.compute_regulation(render_pkg["visibility_filter"])
-                loss += self.cfg['training']['w_def']['w_arap'] * l_arap
-            else:
-                l_rigidtrans, l_rigidrot, l_iso, l_visible = self.net.compute_regulation(render_pkg["visibility_filter"])
-                def_loss = self.cfg['training']['w_def']['rigid']*l_rigidtrans + self.cfg['training']['w_def']['iso']*l_iso+ self.cfg['training']['w_def']['rot']*l_rigidrot+ self.cfg['training']['w_def']['nvisible']*l_visible
-                loss += def_loss
-            
-            loss.backward()
-            viewspace_point_tensor_grad = torch.zeros_like(render_pkg["viewspace_points"])
-            viewspace_point_tensor_grad += render_pkg["viewspace_points"].grad
+                # TODO: not used for now, will use this later for separate optimization of photometric and arap loss
+                # with record_function("backward photometric loss"):
+                #     loss.backward()
+                # with record_function("optimizer step photometric loss"):
+                #     self.net.optimizer.step()
+                #     self.net.optimizer.zero_grad(set_to_none=True)
 
-            ########### Logging & Evaluation ###################
-            with torch.no_grad():
-                # av_loss[0] += Ll1.item()
-                # av_loss[1] += Ll1_depth.item()
-                # av_loss[2] += l_rigidtrans.item()
-                # av_loss[3] += l_rigidrot.item()
-                # av_loss[4] += l_iso.item()
-                # av_loss[5] += l_visible.item()
-                # av_loss[-1] += 1
-                # if ((self.total_iters % self.log_freq) == 0) and self.log:
-                #     wandb.log({'color_loss': av_loss[0] / av_loss[-1],
-                #                'depth_loss': av_loss[1] / av_loss[-1],
-                #                'rigidtrans_loss': av_loss[2] / av_loss[-1],
-                #                'rigidrot_loss': av_loss[3] / av_loss[-1],
-                #                'iso_loss': av_loss[4] / av_loss[-1],
-                #                'visible_loss': av_loss[5] / av_loss[-1],
-                #                'loss': sum(av_loss[:-1]) / av_loss[-1]}, step=self.total_iters)
-                #     av_loss = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
+                # If we are using the mesh aware net, we only receive an ARAP energy term
+                if isinstance(self.net, MeshAwareGaussianModel):
+                    # TODO: add more regularization terms here and use visibility somehow
+                    with record_function("compute arap"):
+                        l_arap = self.net.compute_regulation(render_pkg["visibility_filter"])
+                        # TODO: might need this later for separate optimization of photometric and arap loss
+                        # l_arap = self.cfg['training']['w_def']['w_arap'] * l_arap
+                        loss += self.cfg['training']['w_def']['w_arap'] * l_arap
+                    # TODO: might need this later for separate optimization of photometric and arap loss
+                    # with record_function("backward arap"):
+                    #     l_arap = l_arap.backward()
+                    # with record_function("optimizer step arap"):
+                    #     self.net.optimizer.step()
+                    #     self.net.optimizer.zero_grad(set_to_none=True)
+                else:
+                    l_rigidtrans, l_rigidrot, l_iso, l_visible = self.net.compute_regulation(render_pkg["visibility_filter"])
+                    def_loss = self.cfg['training']['w_def']['rigid']*l_rigidtrans + self.cfg['training']['w_def']['iso']*l_iso+ self.cfg['training']['w_def']['rot']*l_rigidrot+ self.cfg['training']['w_def']['nvisible']*l_visible
+                    loss += def_loss
+                
+                loss.backward()
+                viewspace_point_tensor_grad = torch.zeros_like(render_pkg["viewspace_points"])
+                viewspace_point_tensor_grad += render_pkg["viewspace_points"].grad
 
-                # self.net.add_densification_stats(viewspace_point_tensor_grad, render_pkg["visibility_filter"])
+                ########### Logging & Evaluation ###################
+                with torch.no_grad():
+                    # av_loss[0] += Ll1.item()
+                    # av_loss[1] += Ll1_depth.item()
+                    # av_loss[2] += l_rigidtrans.item()
+                    # av_loss[3] += l_rigidrot.item()
+                    # av_loss[4] += l_iso.item()
+                    # av_loss[5] += l_visible.item()
+                    # av_loss[-1] += 1
+                    # if ((self.total_iters % self.log_freq) == 0) and self.log:
+                    #     wandb.log({'color_loss': av_loss[0] / av_loss[-1],
+                    #                'depth_loss': av_loss[1] / av_loss[-1],
+                    #                'rigidtrans_loss': av_loss[2] / av_loss[-1],
+                    #                'rigidrot_loss': av_loss[3] / av_loss[-1],
+                    #                'iso_loss': av_loss[4] / av_loss[-1],
+                    #                'visible_loss': av_loss[5] / av_loss[-1],
+                    #                'loss': sum(av_loss[:-1]) / av_loss[-1]}, step=self.total_iters)
+                    #     av_loss = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
 
-                # Densification
-                # TODO: implement this in the mesh aware model
-                if iter > self.cfg["training"]["densify_from_iter"] and iter % self.cfg["training"]["densification_interval"] == 0:
-                    self.net.densify(self.cfg["training"]["densify_grad_threshold"])
+                    # self.net.add_densification_stats(viewspace_point_tensor_grad, render_pkg["visibility_filter"])
 
-                # Optimizer step
-                if iter < iters:
-                    self.net.optimizer.step()
-                    self.net.optimizer.zero_grad(set_to_none=True)
+                    # Densification
+                    # TODO: implement this in the mesh aware model
+                    if iter > self.cfg["training"]["densify_from_iter"] and iter % self.cfg["training"]["densification_interval"] == 0:
+                        self.net.densify(self.cfg["training"]["densify_grad_threshold"])
+
+                    #Optimizer step
+                    if iter < iters:
+                        self.net.optimizer.step()
+                        self.net.optimizer.zero_grad(set_to_none=True)
+
+        # Write profiling results to console and export trace to file
+        tqdm.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=400))
+        prof.export_chrome_trace(f'{self.output}/trace.json')
 
 
     def get_deformed_mesh(self, mesh, pc):
@@ -202,24 +228,27 @@ class SceneOptimizer():
                 if gt_color_r is not None:
                     gt_depth, flow_valid = get_depth_from_raft(self.raft, gt_color, gt_color_r, self.baseline)
                 else:
-                    # Reversing preprocessing
-                    raw_gt_color = gt_color.squeeze().cpu().numpy() * 255
-                    raw_gt_color = raw_gt_color.astype(np.uint8)
-                    raw_gt_color = cv2.cvtColor(raw_gt_color, cv2.COLOR_RGB2BGR)
+                    # # Reversing preprocessing
+                    # raw_gt_color = gt_color.squeeze().cpu().numpy() * 255
+                    # raw_gt_color = raw_gt_color.astype(np.uint8)
+                    # raw_gt_color = cv2.cvtColor(raw_gt_color, cv2.COLOR_RGB2BGR)
 
-                    # Use Depth Anything V2 to infer depth on monocular datasets; requires raw image data as np array
-                    input_size_depth = 512
+                    # # Use Depth Anything V2 to infer depth on monocular datasets; requires raw image data as np array
+                    # input_size_depth = 512
 
-                    # Multiplying by 100 to get centimeters, although some github issues claim it outputs dm
-                    # Also, beware that the metric depth estimation of this model seems to be highly specific to the
-                    #  datasets it was trained on since it only outputs 0-1 values and is then scaled by max_depth
-                    #  which was fixed for each dataset. Therefore, it is highly unlikely that we have a real metric
-                    #  depth estimation on our OOD data here. We just got lucky with choosing the 'right' although
-                    #  potentially metrically meaningless max_depth value for our dataset.
-                    gt_depth = self.depth_anything.infer_image(raw_gt_color, input_size=input_size_depth) * 100
+                    # # Multiplying by 100 to get centimeters, although some github issues claim it outputs dm
+                    # # Also, beware that the metric depth estimation of this model seems to be highly specific to the
+                    # #  datasets it was trained on since it only outputs 0-1 values and is then scaled by max_depth
+                    # #  which was fixed for each dataset. Therefore, it is highly unlikely that we have a real metric
+                    # #  depth estimation on our OOD data here. We just got lucky with choosing the 'right' although
+                    # #  potentially metrically meaningless max_depth value for our dataset.
+                    # gt_depth = self.depth_anything.infer_image(raw_gt_color, input_size=input_size_depth) * 100
 
-                    # Make sure the depth map is in the correct format
-                    gt_depth = torch.from_numpy(gt_depth).cuda().unsqueeze(0)
+                    # # Make sure the depth map is in the correct format
+                    # gt_depth = torch.from_numpy(gt_depth).cuda().unsqueeze(0)
+
+                    # TODO: remove later; make gt_depth an empty tensor for some quick debugging, don't need depth model inference atm
+                    gt_depth = torch.zeros_like(gt_color[:, :, :, 0])
 
             frame = ids, gt_color, gt_depth, gt_c2w, tool_mask
 

@@ -571,6 +571,7 @@ class MeshAwareGaussianModel(GaussianModel):
 
         # Compute triangle centers as position for each Gaussian
         positions = ((v0 + v1 + v2) / 3.0)
+        self._xyz = positions
 
         # Compute face normals
         edge1 = v1 - v0
@@ -610,6 +611,8 @@ class MeshAwareGaussianModel(GaussianModel):
         return quat
         
     def forward(self, deform=True):
+        # Deactivate learning for scale
+        self._scaling.requires_grad = False
         # Compute Gaussian positions from mesh and parameters
         xyz, normals = self.compute_positions_and_normals(deform)
         rots = self.rotation_activation(self.compute_rotations_from_normals(normals))
