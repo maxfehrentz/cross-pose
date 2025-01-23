@@ -11,6 +11,8 @@ from src.utils.flow_utils import get_surface_pts
 from functools import partial
 from vtk.util.numpy_support import vtk_to_numpy
 import os
+from torch.autograd import Function
+import arap_cpp
 
 
 class GaussianModel(nn.Module):
@@ -448,6 +450,41 @@ class GaussianModel(nn.Module):
                     self.optimizer.state[group['params'][idx]] = stored_state
 
 
+# Can sublcass autograd.Function to implement custom forward AND backward pass
+class ArapFunction(Function):
+    @staticmethod
+    def forward(ctx, vertices, original_vertices, neighbors, neighbor_mask):
+        # Ensure inputs are on CPU and contiguous
+        # TODO: change that later when we have a GPU version
+        # TODO: depending on the implementation, we may not need the neighbor padding and neighbor_mask; adjacency lists could work
+        vertices = vertices.cpu().contiguous()
+        original_vertices = original_vertices.cpu().contiguous()
+        neighbors = neighbors.cpu().contiguous()
+        neighbor_mask = neighbor_mask.cpu().contiguous()
+        
+        energy, rotations = arap_cpp.compute_arap_energy(
+            vertices, original_vertices, neighbors, neighbor_mask)
+        
+        # TODO: same here, check if padded neighbors and neighbor_mask are needed
+        # Save everything needed for backward
+        ctx.save_for_backward(vertices, original_vertices, neighbors, 
+                            neighbor_mask, rotations)
+        return energy.cuda()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        vertices, original_vertices, neighbors, neighbor_mask, rotations = ctx.saved_tensors
+        
+        # Compute gradients using C++ implementation
+        grad_vertices = arap_cpp.compute_arap_gradient(
+            vertices, original_vertices, neighbors, neighbor_mask,
+            rotations, grad_output)
+        
+        # Note that we are ignoring the gradients of R w.r.t. the vertices since its an independent parameter and only depends on
+        #  the vertices due to the flip-flop trick
+        return grad_vertices.cuda(), None, None, None
+
+
 class MeshAwareGaussianModel(GaussianModel):
     def __init__(self, cfg, n_classes=7):
         super().__init__(cfg, n_classes)
@@ -619,14 +656,15 @@ class MeshAwareGaussianModel(GaussianModel):
         scales = self.scaling_activation(self._scaling)
         opacity = self.opacity_activation(self._opacity)
         return xyz, scales, rots, opacity, self.get_features, self.get_semantics
-        
-    def compute_arap_energy(self):
+    
+    def compute_arap_energy_python(self):
         curr_pos = self.mesh_deformation(self.original_mesh_vertices)
 
         # Compute all edges at once using broadcasting and precomputed padded neighbors
         #   Unsqueezing along dim 1 -> (#vertices, broadcasted to #neighbors, 3)
         #   Indexing with padded neighbors -> (#vertices, #max_neighbors, 3)
         #   Can then subtract to get all edge vectors, shape (#vertices, #max_neighbors, 3)
+        # TODO: potential bug: what happens here where the padded_neighbor values are -1? will just give last vertex??
         curr_edges = curr_pos.unsqueeze(1) - curr_pos[self.padded_neighbors]
         
         # Compute covariance matrices for each vertex (Si in the original ARAP paper), assuming uniform weights
@@ -678,9 +716,17 @@ class MeshAwareGaussianModel(GaussianModel):
         arap_energy = masked_diff.sum()
         
         return arap_energy
-
+        
+    def compute_arap_energy_cpp(self):
+        curr_pos = self.mesh_deformation(self.original_mesh_vertices)
+        return ArapFunction.apply(curr_pos, 
+                        self.original_mesh_vertices,
+                        self.padded_neighbors,
+                        self.neighbor_mask)
+        
+    # TODO: add more regularization terms here
     def compute_regulation(self, visibility_filter):
-        arap_energy = self.compute_arap_energy()
+        arap_energy = self.compute_arap_energy_cpp()
         return arap_energy
 
     def build_neighbors(self, faces):
