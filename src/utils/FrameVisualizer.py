@@ -6,7 +6,7 @@ import cv2
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib import cm
-from src.utils.renderer import render
+from src.utils.renderer import render, render_mesh_deformations
 from src.utils.camera import Camera
 from src.utils.semantic_utils import SemanticDecoder
 
@@ -23,16 +23,22 @@ class FrameVisualizer(object):
         self.outmap = os.path.join(outpath, 'mapping')
         self.outrack = os.path.join(outpath, 'tracking')
         self.outsem = os.path.join(outpath, 'semantic')
+        self.outoverlay = os.path.join(outpath, 'overlays')
+        self.outdeformation = os.path.join(outpath, 'deformation')
+        self.outmesh = os.path.join(outpath, 'mesh')
         os.makedirs(self.outmap, exist_ok=True)
         os.makedirs(self.outrack, exist_ok=True)
         os.makedirs(self.outsem , exist_ok=True)
+        os.makedirs(self.outoverlay, exist_ok=True)
+        os.makedirs(self.outdeformation, exist_ok=True)
+        os.makedirs(self.outmesh, exist_ok=True)
         self.camera = Camera(cfg['cam'])
         self.widefield_camera = Camera(cfg['cam_widefield'])
         self.decoder = SemanticDecoder()
         self.net = net
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    def save_imgs(self, idx, gt_depth, gt_color, c2w, pts_pred=None, pts_gt=None, mesh=None, registration=None, deformed_mesh=None):
+    def save_imgs(self, idx, gt_depth, gt_color, c2w, mesh=None, registration=None, deformed_mesh=None):
         """
         Visualization of depth and color images and save to file.
         Args:
@@ -40,24 +46,59 @@ class FrameVisualizer(object):
         """
         self.camera.set_c2w(c2w)
         render_pkg = render(self.camera, self.net, self.background, mesh=mesh, registration=registration, deform=True, deformed_mesh=deformed_mesh)
-        self.plot_mapping(render_pkg['depth'], render_pkg['render'], gt_depth, gt_color, 
-                         render_pkg['mesh_surface'], render_pkg['mesh_depth'],
-                         render_pkg['deformed_surface'], render_pkg['deformed_depth'])
+        
+        # Make everything relative; gt depth anything is already relative depth
+        relative_depth = render_pkg['depth'] / render_pkg['depth'].max()
+        relative_mesh_depth = render_pkg['mesh_depth'] / render_pkg['mesh_depth'].max()
+        relative_deformed_depth = render_pkg['deformed_depth'] / render_pkg['deformed_depth'].max()
+
+
+        self.plot_mapping(relative_depth, render_pkg['render'], gt_depth, gt_color, 
+                         render_pkg['mesh_surface'], relative_mesh_depth,
+                         render_pkg['deformed_surface'], relative_deformed_depth)
         outmap = os.path.join(self.outmap,f'{idx:05d}.jpg')
         plt.savefig(outmap, bbox_inches='tight', pad_inches=0.2, dpi=300)
+
+        # Create two more figures, alpha blending the rendered image, the deformed mesh and the original mesh, both are already images
+        alpha = 0.25
+        fig, ax = plt.subplots(1, 1)
+        ax.imshow(gt_color.squeeze(0).cpu().numpy())
+        ax.imshow(render_pkg['init_wireframe'], alpha=alpha)
+        ax.axis('off')
+        outmap_overlay_deformed = os.path.join(self.outoverlay,f'{idx:05d}_overlay_init.jpg')
+        plt.savefig(outmap_overlay_deformed, bbox_inches='tight', pad_inches=0, dpi=300)
+        fig, ax = plt.subplots(1, 1)
+        ax.imshow(gt_color.squeeze(0).cpu().numpy())
+        ax.imshow(render_pkg['deformed_wireframe'], alpha=alpha)
+        ax.axis('off')
+        outmap_overlay_undeformed = os.path.join(self.outoverlay, f'{idx:05d}_overlay_warped.jpg')
+        plt.savefig(outmap_overlay_undeformed, bbox_inches='tight', pad_inches=0, dpi=300)
+        plt.close()
+
+        # Create two more figures, deformed and undeformed mesh in surface rendering, not wireframe
+        fig, ax = plt.subplots(1, 1)
+        ax.imshow(render_pkg['deformed_surface'])
+        ax.axis('off')
+        outmesh_deformed = os.path.join(self.outmesh, f'{idx:05d}_deformed.jpg')
+        plt.savefig(outmesh_deformed, bbox_inches='tight', pad_inches=0, dpi=300)
+        fig, ax = plt.subplots(1, 1)
+        ax.imshow(render_pkg['mesh_surface'])
+        ax.axis('off')
+        outmesh_undeformed = os.path.join(self.outmesh, f'{idx:05d}_undeformed.jpg')
+        plt.savefig(outmesh_undeformed, bbox_inches='tight', pad_inches=0, dpi=300)
         plt.close()
 
         img_sem = self.plot_semantics(c2w)
         outsem = os.path.join(self.outsem,f'{idx:05d}.jpg')
         imsave(outsem, img_sem)
 
-        if pts_pred is not None:
-            img_track = self.plot_tracking(pts_pred, render_pkg['render'], gt_color, pts_gt)
-            outrack = os.path.join(self.outrack,f'{idx:05d}.jpg')
-            imsave(outrack, img_track)
-        else:
-            outrack = None
-        return outmap, outsem, outrack
+        return outmap, outsem
+    
+    def save_mesh_deformations(self, idx, c2w, mesh, deformed_mesh, registration, control_vertices, control_def):
+        self.camera.set_c2w(c2w)
+        deformation_vis = render_mesh_deformations(self.camera, mesh, deformed_mesh, registration, control_vertices, control_def)
+        outdeformation = os.path.join(self.outdeformation, f'{idx:05d}.jpg')
+        imsave(outdeformation, deformation_vis)
 
     def plot_mapping(self, depth, color, gt_depth, gt_color, mesh_surface=None, mesh_depth=None, deformed_surface=None, deformed_depth=None):
         gt_depth_np = gt_depth.squeeze(0).cpu().numpy()
@@ -78,8 +119,7 @@ class FrameVisualizer(object):
         else:
             fig, axs = plt.subplots(2, 3)
 
-        # TODO: change later, only for debugging
-        max_depth = np.max(depth_np)
+        max_depth = 1.0
 
         axs[0, 0].imshow(gt_depth_np, vmin=0, vmax=max_depth)
         axs[0, 0].set_title('Input Depth')

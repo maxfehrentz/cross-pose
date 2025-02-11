@@ -232,29 +232,39 @@ class ExplicitSparseDeformation(ExplicitDeformation):
 
 
 class MeshSparseDeformation(nn.Module):
-    def __init__(self, vertices, subsample: int=64):
+    def __init__(self, vertices, visible_vertices=None, subsample: int=32, k: int=25):
         super().__init__()
-        self.subsample = subsample
         
-        # Initialize control vertices
-        n_vertices = vertices.shape[0]
-        control_ids = np.random.permutation(np.arange(n_vertices))[::self.subsample]
+        if visible_vertices is None:
+            # Initialize control vertices
+            n_vertices = vertices.shape[0]
+            control_ids = np.random.permutation(np.arange(n_vertices))[::subsample]
+        else:
+            control_ids = visible_vertices[::subsample]
+            self.visible_vertices = visible_vertices
+
         self.control_ids = torch.tensor(control_ids, device='cuda')
         
         # Initialize deformation parameters for control vertices
         self.control_def = torch.nn.Parameter(torch.zeros(len(self.control_ids), 3, device='cuda'))
         
+        # Build KDTree from control vertices
         tree = KDTree(vertices[self.control_ids].detach().cpu().numpy())
 
-        # TODO: come back to k and eps
         # Yields the k-nearest control points for each vertex, shape [n_vertices, k]
-        neighbour_dists, neighbours = tree.query(vertices.detach().cpu().numpy(), k=20)
+        neighbour_dists, neighbours = tree.query(vertices.detach().cpu().numpy(), k=k)
 
+        # Store distances and weights
         self.neighbour_dists = torch.tensor(neighbour_dists, device="cuda", dtype=torch.float32)
+
         self.neighbours = torch.tensor(neighbours, device="cuda")
         self.neighbour_weights = torch.exp(-4.5*(self.neighbour_dists))
+
         # Yields a sum of shape [n_vertices, 1]
         self.neighbour_weights_sum = self.neighbour_weights.sum(dim=-1).clamp(1e-2)
+
+        # Adding cache to store previous and current deformed vertices
+        self.mean_cache = [None, None]
 
     def interpolate(self):
         """
@@ -269,9 +279,41 @@ class MeshSparseDeformation(nn.Module):
         vertices_def = (self.neighbour_weights[...,None] * self.control_def[self.neighbours]).sum(dim=1) / self.neighbour_weights_sum[...,None]
         return vertices_def
 
-    def forward(self, vertices):
-        """Compute deformed vertex positions"""
+    def forward(self, vertices):        
         vertices_def = self.interpolate()
         vertices_deformed = vertices + vertices_def
+        if self.mean_cache[0] is not None:
+            # Detach cache to avoid backprop through cache
+            self.mean_cache[1] = self.mean_cache[0].detach()
+        self.mean_cache[0] = vertices_deformed
         return vertices_deformed
+
+    def compute_rigid_loc_loss(self):
+        if self.mean_cache[1] is None:
+            return torch.tensor(0, device="cuda")
+
+        cur_offset = self.mean_cache[0][self.neighbours] - self.mean_cache[0][:,None]
+        last_offset = self.mean_cache[1][self.neighbours] - self.mean_cache[1][:,None]
+        delta = last_offset - cur_offset
+        l_rigid = (torch.linalg.norm(delta, dim=-1) * self.neighbour_weights).mean()
+        return l_rigid
+    
+    def compute_rigid_rot_loss(self):
+        # TODO: implement
+        return torch.tensor(0, device="cuda")
+    
+    def compute_iso_loss(self):
+        # if self.mean_cache[1] is None:
+        #     return torch.tensor(0, device="cuda")
+        
+        # cur_offset = self.mean_cache[0][self.neighbours] - self.mean_cache[0][:,None]
+        # curr_offset_mag = torch.linalg.norm(cur_offset, dim=-1)
+        
+        # # Normalize by mean neighbor distance to get comparable scale to rigid_loc_loss
+        # mean_neighbor_dist = self.neighbour_dists.mean()
+        # l_iso = (torch.abs(curr_offset_mag - self.neighbour_dists) / mean_neighbor_dist * self.neighbour_weights).mean()
+        
+        # return l_iso
+
+        return torch.tensor(0, device="cuda")
         

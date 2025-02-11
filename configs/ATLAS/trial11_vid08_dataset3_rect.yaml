@@ -1,0 +1,14 @@
+inherit_from: configs/ATLAS/atlas_base.yaml
+cam:
+  H: 920
+  W: 922
+  fx: 1203.7672119140625
+  fy: 1203.7672119140625
+  cx: 468.16961669921875
+  cy: 506.98687744140625
+
+data:
+  image_input_folder: /home/fsc/max/Data/Pigs/trial11/dataset3_rect
+  mesh: /home/fsc/max/Data/Pigs/trial11/CT/cavity_minimal_cleaned_3.obj
+  transforms: /home/fsc/max/Data/Pigs/trial11/dataset3_rect/transforms.json
+  output: output/ATLAS/trial11_vid08/dataset3_rect

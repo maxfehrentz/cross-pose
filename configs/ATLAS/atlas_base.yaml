@@ -1,0 +1,33 @@
+inherit_from: configs/base.yaml
+device: cuda
+scale: null # Specified in a utils file with other transformations instead of here
+dataset: 'ATLAS'
+
+training:
+  optical_flow_init: False
+  # TODO: figure this out; should be high but becomes unstable at 10
+  w_depth: 10 # default: 10
+  w_color: 5 # default: 5
+  w_def:
+    w_arap: 1 # TODO: figure that out
+    w_scale: 100 # TODO: figure that out
+  feature_lr: 0.0025 # default: 0.0025
+  barycentric_coords_lr: .01
+
+  deformation_lr_init: 0.0025 # default: 0.00016
+
+  iters: 100 # default: 100
+  iters_first: 100 # default: 1000
+
+  # TODO: maybe enable again at some point
+  densify_from_iter: 100000 # default: 100
+  densification_interval: 50 # default: 100
+  densify_grad_threshold: 0.001 # default: 0.002
+
+  # TODO: Might want to enable this again at some point
+  grad_weighing: False # default: True
+
+model:
+  deform_network:
+    subsample: 8 # default: 32
+    k: 15 # default: 25

@@ -1,0 +1,15 @@
+inherit_from: configs/ATLAS/atlas_base.yaml
+
+cam:
+  H: 540
+  W: 960
+  fx: 587.36083984375
+  fy: 587.36083984375
+  cx: 529.1632080078125
+  cy: 271.7477111816406
+
+data:
+  image_input_folder: /home/fsc/max/Data/Pigs/pig7/dynamic_breathing_half_res
+  transforms: /home/fsc/max/Data/Pigs/pig7/dynamic_breathing_half_res/transforms.json
+  mesh: /home/fsc/max/Data/Pigs/pig7/ImFusionExport_abdominal_cavity_coarse.obj
+  output: output/ATLAS/pig7/dynamic_breathing

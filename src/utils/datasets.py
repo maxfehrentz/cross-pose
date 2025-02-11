@@ -17,15 +17,11 @@ class Atlas(Dataset):
         self.name = cfg['dataset']
 
         self.scale = scale
-
-        if args.input_folder is None:
-            self.input_folder = cfg['data']['input_folder']
-        else:
-            self.input_folder = args.input_folder
+        self.input_folder = cfg['data']['image_input_folder']
+        self.transforms_path = cfg['data']['transforms']
 
         # Load cameras and image and mask paths
-        self.poses, self.color_paths, self.mask_paths, self.registration_matrices = self.load_cams_and_filepaths(
-            os.path.join(self.input_folder, 'transforms.json'))
+        self.poses, self.color_paths, self.mask_paths, self.seg_paths, self.registration_matrices = self.load_cams_and_filepaths(self.transforms_path)
 
         # TODO: what about semantic decoder? ignore for now
         # self.semantic_decoder = SemanticDecoder()
@@ -39,8 +35,10 @@ class Atlas(Dataset):
 
         frames = data['frames']
 
+        # Safely get paths, handling cases where they might not exist in the frame or be None
         color_paths = [os.path.join(self.input_folder, frame['file_path']) for frame in frames]
-        mask_paths = [os.path.join(self.input_folder, frame['mask_path']) for frame in frames]
+        mask_paths = [os.path.join(self.input_folder, frame['mask_path']) if 'mask_path' in frame and frame['mask_path'] is not None else None for frame in frames]
+        seg_paths = [os.path.join(self.input_folder, frame['segmentation_path']) if 'segmentation_path' in frame and frame['segmentation_path'] is not None else None for frame in frames]
         poses = np.array([frame['transform_matrix'] for frame in frames], dtype=float)
         poses = torch.from_numpy(poses).float()
         registration_matrices = np.array([frame['mesh_matrix'] for frame in frames], dtype=float)
@@ -68,7 +66,7 @@ class Atlas(Dataset):
         # Reorient world space
         poses = SWAP_AND_FLIP_WORLD_AXES @ poses
 
-        return poses, color_paths, mask_paths, registration_matrices
+        return poses, color_paths, mask_paths, seg_paths, registration_matrices
 
 
     def __getitem__(self, index):
@@ -76,30 +74,40 @@ class Atlas(Dataset):
         color_data = torch.from_numpy(color_data)
         color_data = color_data / 255.
 
-        # TODO: will later need tool masking as well
-        mask_path = self.mask_paths[index]
-        if os.path.isfile(mask_path):
-            mask_data = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            mask_data = cv2.resize(mask_data, (color_data.shape[1], color_data.shape[0]), interpolation=cv2.INTER_NEAREST)
-            # mask_data = torch.from_numpy(binary_erosion(mask_data, iterations=7, border_value=1) > 0).bool()
-            mask_data = torch.from_numpy(mask_data).bool()
+        # Handle alpha mask (background mask)
+        alpha_mask = None
+        if self.mask_paths[index] is not None:
+            mask_path = self.mask_paths[index]
+            if os.path.isfile(mask_path):
+                alpha_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                alpha_mask = cv2.resize(alpha_mask, (color_data.shape[1], color_data.shape[0]), interpolation=cv2.INTER_NEAREST)
+                alpha_mask = torch.from_numpy(alpha_mask).bool()
+
+        # Handle tool segmentation
+        tool_mask = None
+        if self.seg_paths[index] is not None:
+            seg_path = self.seg_paths[index]
+            if os.path.isfile(seg_path):
+                tool_mask = cv2.imread(seg_path, cv2.IMREAD_GRAYSCALE)
+                tool_mask = cv2.resize(tool_mask, (color_data.shape[1], color_data.shape[0]), interpolation=cv2.INTER_NEAREST)
+                tool_mask = torch.from_numpy(tool_mask).bool()
+
+        # Combine masks based on what's available
+        if tool_mask is not None:
+            if alpha_mask is not None:
+                mask_data = tool_mask & alpha_mask
+            else:
+                mask_data = tool_mask
         else:
-            print(f"No mask found for path {mask_path}")
+            mask_data = alpha_mask
 
-            mask_data = None
-
-        # TODO: can add some semantic segmentation here later
         semantics = None
-
         pose = self.poses[index]
         registration_matrix = self.registration_matrices[index]
-
         intrinsics = self.intrinsics[index]
 
-        # Returning none for color_data_r for now, as we don't have stereo images
         return index, color_data, None, pose, registration_matrix, mask_data, semantics, intrinsics
-
-
+    
     def __len__(self):
         return len(self.poses)
 

@@ -61,8 +61,6 @@ class GaussianModel(nn.Module):
         """
             apply deformation and return 3D Gaussians for rasterization
         """
-        # TODO: not sure why this yields so much better results, come back to this
-        # Disable gradient for scaling
         self._scaling.requires_grad_(False)
 
         if deform:
@@ -147,7 +145,6 @@ class GaussianModel(nn.Module):
         triangle_centers = (transform[:3, :3] @ triangle_centers.T).T * SCALE
         points = triangle_centers
         rgb_norm = torch.ones_like(points)
-        # TODO: Fused stuff here came initally from additional tool masking; have to add that later, see create_from_pcd
         fused_point_cloud = points
         fused_color = RGB2SH(rgb_norm)
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -271,6 +268,9 @@ class GaussianModel(nn.Module):
         self._deformation.replace(optimizable_tensors['deformation'], optimizable_tensors['xyz'], reinit=True)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
+        """
+            Adds new tensors to the optimizer
+        """
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] not in tensors_dict:
@@ -343,11 +343,15 @@ class GaussianModel(nn.Module):
 
         if not selected_pts_mask.any():
             return
+        # Repeats each row N times -> essentially splits the selected points into N*selectedpoints new points
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
+        # Draw N samples from a normal distribution with the given means and stds
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        # Rotates the samples and adds the original points
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        # Rescales the new Gaussians
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
@@ -358,6 +362,7 @@ class GaussianModel(nn.Module):
         new_semantics = self._semantics
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_semantics)
 
+        # Will remove all points that were selected for densification, keep the ones that were not selected, and keep the new split points
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
@@ -366,7 +371,7 @@ class GaussianModel(nn.Module):
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        # exclude Gaussians which are settled based on grad_weighing
+        # exclude Gaussians which are settled based on grad_weighing; they are only updated a maximum visit_offset-times
         selected_pts_mask = torch.logical_and(selected_pts_mask, self.gradient_accum.squeeze() < self.cfg['visit_offset'])
         new_xyz = self._xyz[selected_pts_mask] 
         # - 0.001 * self._xyz.grad[selected_pts_mask]
@@ -490,13 +495,21 @@ class MeshAwareGaussianModel(GaussianModel):
         super().__init__(cfg, n_classes)
         self.current_mesh_vertices = None
         self.mesh_faces = None
-        self.barycentric_coords = None
+        self._barycentric_coords = None
         self._xyz = torch.empty(0)
         self.original_mesh_vertices = None
         self.original_edges = None
-        self.neighbors = None
+        self.padded_neighbors = None
+        self.neighbor_mask = None
         self.mesh_deformation = None
+        self.cfg = cfg
+        self.barycentric_activation = torch.softmax
+        self._parent_faces = None
 
+    # TODO: becoming more and more problematic, was used in other parts of the codebase to get #gaussians
+    #  problematic: we only compute the positions aka xyz in the next forward pass but the rendering config is set up based on get_xyz which
+    #  still holds the old number of gaussians -> conflict during backward pass
+    # Using #parent faces now when needing #gaussians
     @property
     def get_xyz(self):
         return self._xyz
@@ -505,9 +518,8 @@ class MeshAwareGaussianModel(GaussianModel):
     def get_mesh_vertices(self):
         return self.current_mesh_vertices
         
-    def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0):
+    def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0, gaussians_per_triangle=25):
         self.spatial_lr_scale = spatial_lr_scale
-
         register_mesh(mesh, registration)
         
         # Get vertices
@@ -528,33 +540,37 @@ class MeshAwareGaussianModel(GaussianModel):
         # Topology is constant
         n_triangles = faces.shape[0]
         self.mesh_faces = faces
+        n_total_gaussians = n_triangles * gaussians_per_triangle
         
-        # TODO: change later, fixing this and not making it a parameter for now
-        # self.barycentric_coords = nn.Parameter(torch.ones(
-        #     n_triangles, 3).cuda() / 3.0)   
-        self.barycentric_coords = torch.ones(n_triangles, 3).cuda() / 3.0
+        # Initialize random barycentric coordinates with noise
+        barycentric_coords = torch.randn((n_total_gaussians, 3), device='cuda')
+        self._barycentric_coords = nn.Parameter(barycentric_coords.requires_grad_(True))
+        
+        # Initialize parent face indices
+        self._parent_faces = torch.arange(n_triangles, device='cuda').repeat_interleave(gaussians_per_triangle)
 
-        # Compute initial positions, no deformation yet
         xyz, _ = self.compute_positions_and_normals(deform=False)
 
-        # TODO: remove later if possible, super hacky; for some reason, just allocating a dummy tensor fixes the illegal memory access issues?? memory alignment issue?
-        dummy_tensor = torch.zeros((xyz.shape[0], 3), dtype=torch.float32, device="cuda")
-        
-        # Initialize other parameters as before
-        rgb_norm = torch.ones((n_triangles, 3)).cuda()
+        # Grey color init
+        rgb_norm = torch.tensor([0.5, 0.5, 0.5]).cuda()
+
         fused_color = RGB2SH(rgb_norm)
-        features = torch.zeros((n_triangles, 3, (self.max_sh_degree + 1) ** 2), device="cuda")
+        features = torch.zeros((n_total_gaussians, 3, (self.max_sh_degree + 1) ** 2), device="cuda")
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
         
         # Initialize scales, rotations, opacities
         dist2 = torch.clamp_min(distCUDA2(xyz), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((n_triangles, 4), device="cuda")
-        rots[:, 0] = 1
-        opacities = inverse_sigmoid(0.6*torch.ones((n_triangles, 1), device="cuda"))
+        # Only optimizing over 2 scale components, third is fixed to "flatten" the Gaussian
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
 
-        self._xyz = xyz
+        # Store original scales for regularization
+        self.original_scales = scales.clone()
+
+        # TODO: default was factor 0.6, making them fully opaque to improve coupling to the mesh but might
+        #  change this again later
+        opacities = inverse_sigmoid(1.0*torch.ones((n_total_gaussians, 1), device="cuda"))
+
         # Store as parameters with explicit contiguous memory layout
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -564,7 +580,6 @@ class MeshAwareGaussianModel(GaussianModel):
         # Initialize semantics if needed
         self._semantics = torch.ones((*depth.shape, self.n_classes), device="cuda").squeeze(0)
 
-        
         print("Precomputing neighbor information...")
         self.padded_neighbors, self.neighbor_mask = self.build_neighbors(faces)
 
@@ -575,8 +590,27 @@ class MeshAwareGaussianModel(GaussianModel):
         #   Can then subtract to get all edge vectors, shape (#vertices, #max_neighbors, 3)
         self.original_edges = self.original_mesh_vertices.unsqueeze(1) - self.original_mesh_vertices[self.padded_neighbors]
 
+
+    def setup_deformation_field(self, visibility_filter, mesh=None, registration=None):
+        # Look up the parent triangles for each visible Gaussian
+        parent_triangles = self._parent_faces[visibility_filter]
+        # Check for unique parent triangles
+        unique_parent_triangles = torch.unique(parent_triangles)
+
+        # Look up the relevant vertices for each parent triangle
+        relevant_vertex_indices = self.mesh_faces[unique_parent_triangles]
+        relevant_vertex_indices = relevant_vertex_indices.view(-1)
+        unique_relevant_vertices = torch.unique(relevant_vertex_indices)
+
+        print(f"shape of unique relevant vertices: {unique_relevant_vertices.shape}")
+
         # Initialize mesh deformation
-        self.mesh_deformation = MeshSparseDeformation(self.original_mesh_vertices, subsample=64)
+        self.mesh_deformation = MeshSparseDeformation(
+            self.original_mesh_vertices,
+            visible_vertices=unique_relevant_vertices,
+            subsample=self.cfg['deform_network']['subsample'],
+            k=self.cfg['deform_network']['k']
+        )
 
     def training_setup(self, training_args):
         self.percent_dense = training_args["percent_dense"]
@@ -585,6 +619,7 @@ class MeshAwareGaussianModel(GaussianModel):
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
+            {'params': [self._barycentric_coords], 'lr': training_args["barycentric_coords_lr"], "name": "barycentric_coords"},
             {'params': self.mesh_deformation.parameters(), 'lr': training_args["deformation_lr_init"] * self.spatial_lr_scale, "name": "deformation"},
             {'params': [self._features_dc], 'lr': training_args["feature_lr"], "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args["feature_lr"] / 20.0, "name": "f_rest"},
@@ -600,14 +635,17 @@ class MeshAwareGaussianModel(GaussianModel):
             self.current_mesh_vertices = vertices
         else:
             vertices = self.current_mesh_vertices
-        
-        # Get vertices for each triangle face
-        v0 = vertices[self.mesh_faces[:, 0]]
-        v1 = vertices[self.mesh_faces[:, 1]]
-        v2 = vertices[self.mesh_faces[:, 2]]
 
-        # Compute triangle centers as position for each Gaussian
-        positions = ((v0 + v1 + v2) / 3.0)
+        # Each Gaussian is associated with a parent face
+        relevant_vertices = vertices[self.mesh_faces[self._parent_faces]]
+        # Compute position for each Gaussian based on barycentric coordinates
+        barycentric_coords = self.barycentric_activation(self._barycentric_coords, dim=1)
+        v0 = relevant_vertices[:, 0]
+        v1 = relevant_vertices[:, 1]
+        v2 = relevant_vertices[:, 2]
+        positions = (v0 * barycentric_coords[:, 0].unsqueeze(-1) + 
+                     v1 * barycentric_coords[:, 1].unsqueeze(-1) + 
+                     v2 * barycentric_coords[:, 2].unsqueeze(-1))
         self._xyz = positions
 
         # Compute face normals
@@ -635,7 +673,8 @@ class MeshAwareGaussianModel(GaussianModel):
         
         # Compute rotation angle; cos(angle) is the dot product between normals and z-axis, acos retrieves angle in radians
         cos_angle = torch.sum(normals * z_axis.expand_as(normals), dim=1)
-        angle = torch.acos(torch.clamp(cos_angle, -1.0, 1.0))
+        # Have to clamp to avoid nan values
+        angle = torch.acos(torch.clamp(cos_angle, -0.999999, 0.999999))
         
         # Convert to quaternion (w, x, y, z format) where  q = (w, x, y, z) = (cos(θ/2), axsin(θ/2), aysin(θ/2), azsin(θ/2)) with ax, ay, az being the rotation axis
         sin_half_angle = torch.sin(angle/2)[:, None]
@@ -646,16 +685,145 @@ class MeshAwareGaussianModel(GaussianModel):
         ], dim=1)
         
         return quat
+
+    def prune_points(self, mask):
+        valid_points_mask = ~mask
+        optimizable_tensors = self._prune_optimizer(valid_points_mask)
+
+        # Update parent faces
+        self._parent_faces = self._parent_faces[valid_points_mask]
+        # Update barycentric coords
+        self._barycentric_coords = optimizable_tensors["barycentric_coords"]
+        # Update "original" scales
+        self.original_scales = self.original_scales[valid_points_mask]
+
+        grad_weighing = self.hooks is not None
+        self.enable_grad_weighing(False)
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+        self.gradient_accum = self.gradient_accum[valid_points_mask]
+        self.denom = self.denom[valid_points_mask]
+        self.enable_grad_weighing(grad_weighing)
+
+    def densification_postfix(self, new_barycentric, new_features_dc, new_features_rest, 
+                            new_opacity, new_scaling, new_parent_faces):
+        d = {
+            "barycentric_coords": new_barycentric,
+            "f_dc": new_features_dc,
+            "f_rest": new_features_rest,
+            "opacity": new_opacity,
+            "scaling": new_scaling
+        }
+
+        # Adds the new tensors to the optimizer
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        # TODO: investigate grad weighing stuff
+        grad_weighing = self.hooks is not None
+        self.enable_grad_weighing(False)
+        
+        # Update parameters
+        self._barycentric_coords = optimizable_tensors["barycentric_coords"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        
+        # Update parent face tracking
+        self._parent_faces = torch.cat([self._parent_faces, new_parent_faces])
+
+        # Have to keep xyz gradient up to date in terms of shape because those are the 2d grads of the 3d gaussians returned from the renderer
+        #  and we need them to decide where to densify
+        # Update itself happens in the stats update method of the superclass
+        self.xyz_gradient_accum = torch.zeros((self._parent_faces.shape[0], 1), device="cuda")
+        self.gradient_accum = torch.cat((self.gradient_accum, 
+            torch.zeros((new_barycentric.shape[0], 1), device="cuda")), dim=0)
+        self.denom = torch.zeros((self._parent_faces.shape[0], 1), device="cuda")
+
+        # Also have to add scales for the new points for regularization
+        self.original_scales = torch.cat((self.original_scales, new_scaling), dim=0)
+
+        self.enable_grad_weighing(grad_weighing)
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        # Gives us the number of Gaussians since each Gaussian is associated with a parent face
+        n_init_points = self._parent_faces.shape[0]
+
+        # Extract points that satisfy the gradient condition
+        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad[:grads.shape[0]] = grads.squeeze()
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        
+        # exclude Gaussians which are settled based on grad_weighing
+        # TODO: causes some issues, coming back to this later
+        # selected_pts_mask = torch.logical_and(selected_pts_mask, self.gradient_accum.squeeze() < self.cfg['visit_offset'])
+
+        if not selected_pts_mask.any():
+            return
+
+        # Get parent faces of selected Gaussians
+        parent_faces = self._parent_faces[selected_pts_mask]
+        
+        # We do not need the actual barycentric coordinates, just the values before softmax activation
+        # N tells us how many new Gaussians we want to create for each selected one
+        new_barycentric = torch.randn((selected_pts_mask.sum() * N, 3), device="cuda")
+
+        # Keeping track of parent faces
+        new_parent_faces = parent_faces.repeat(N)
+
+        # Create other attributes as in superclass
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+
+        # Call modified densification_postfix
+        self.densification_postfix(new_barycentric, new_features_dc, new_features_rest, 
+                                 new_opacity, new_scaling, new_parent_faces)
+
+        # Will remove all points that were selected for densification, keep the ones that were not selected, and keep the new split points
+        prune_filter = torch.cat((selected_pts_mask, 
+                                torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        # Extract points that satisfy the gradient condition
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+        selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        
+        # exclude Gaussians which are settled based on grad_weighing; they are only updated a maximum visit_offset-times
+        # TODO: causes issues, come back to this
+        # selected_pts_mask = torch.logical_and(selected_pts_mask, self.gradient_accum.squeeze() < self.cfg['visit_offset'])
+
+        new_barycentric = self._barycentric_coords[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_parent_faces = self._parent_faces[selected_pts_mask]
+
+        self.densification_postfix(new_barycentric, new_features_dc, new_features_rest, new_opacities, new_scaling, new_parent_faces)
         
     def forward(self, deform=True):
-        # Deactivate learning for scale
-        self._scaling.requires_grad = False
+        # TODO: for improved coupling between Gaussians and mesh, might change again later though
+        self._opacity.requires_grad = False
+
         # Compute Gaussian positions from mesh and parameters
         xyz, normals = self.compute_positions_and_normals(deform)
         rots = self.rotation_activation(self.compute_rotations_from_normals(normals))
+
         scales = self.scaling_activation(self._scaling)
+        capped_scales = torch.minimum(scales, self.scaling_activation(self.original_scales) * 10)
+
         opacity = self.opacity_activation(self._opacity)
-        return xyz, scales, rots, opacity, self.get_features, self.get_semantics
+        # Fixing the z direction (normal of parent face) scale to be small -> "flat" Gaussian
+        z_scaling = self.scaling_activation(torch.ones((scales.shape[0], 1), device="cuda") * -100)
+        return xyz, torch.cat((capped_scales, z_scaling), dim=-1), rots, opacity, self.get_features, self.get_semantics
     
     def compute_arap_energy_python(self):
         curr_pos = self.mesh_deformation(self.original_mesh_vertices)
@@ -724,10 +892,29 @@ class MeshAwareGaussianModel(GaussianModel):
                         self.padded_neighbors,
                         self.neighbor_mask)
         
-    # TODO: add more regularization terms here
-    def compute_regulation(self, visibility_filter):
-        arap_energy = self.compute_arap_energy_cpp()
-        return arap_energy
+    def compute_regularization(self, visibility_filter):
+        # arap_energy = self.compute_arap_energy_cpp()
+        arap_energy = torch.tensor(0, device="cuda")
+
+        # scale_loss = torch.max(self.scaling_activation(self._scaling), self.scaling_activation(self.original_scales)).mean()
+        scale_loss = torch.tensor(0, device="cuda")
+
+        # E_rigid_loc punishes changes in relative position between control vertices and their k nearest neighbors
+        rigid_loc_loss = self.mesh_deformation.compute_rigid_loc_loss()
+
+        # E_rigid_rot punishes changes in relative rotation between control vertices and their k nearest neighbors
+        rigid_rot_loss = self.mesh_deformation.compute_rigid_rot_loss()
+
+        # E_iso is a relaxed version of E_rigid_loc, punishing changes in relative distance unrelated to direction
+        iso_loss = self.mesh_deformation.compute_iso_loss()
+
+        # Add visibility loss, punish deformations on vertices that are not visible
+        invisible_parent_triangles = self._parent_faces[~visibility_filter].unique()
+        invisible_vertices = self.mesh_faces[invisible_parent_triangles].unique()
+        invisible_vertices = invisible_vertices.view(-1)
+        visibility_loss = torch.linalg.norm(self.current_mesh_vertices[invisible_vertices] - self.original_mesh_vertices[invisible_vertices], dim=1).mean()
+        
+        return arap_energy, scale_loss, rigid_loc_loss, rigid_rot_loss, iso_loss, visibility_loss
 
     def build_neighbors(self, faces):
         # Load torch tensors from a file if they exist
