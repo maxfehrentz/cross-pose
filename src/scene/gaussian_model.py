@@ -13,6 +13,7 @@ from vtk.util.numpy_support import vtk_to_numpy
 import os
 from torch.autograd import Function
 import arap_cpp
+# import arap_cuda
 
 
 class GaussianModel(nn.Module):
@@ -460,27 +461,50 @@ class ArapFunction(Function):
     @staticmethod
     def forward(ctx, vertices, original_vertices, neighbors, neighbor_mask):
         # Ensure inputs are on CPU and contiguous
-        # TODO: change that later when we have a GPU version
-        # TODO: depending on the implementation, we may not need the neighbor padding and neighbor_mask; adjacency lists could work
+        
+        # if cuda:
+        #     energy, rotations = arap_cuda.compute_arap_energy_cuda(
+        #         vertices, original_vertices, neighbors, neighbor_mask, weights)
+        # else:
+        #     # Move to CPU; other values are already there
+        #     # Note that we have to do this here, otherwise the vertices come in on cpu but we return the gradient on gpu -> error
+        #     print("Computing ARAP on CPU")
+        #     vertices = vertices.cpu().contiguous()
+        #     weights = weights.cpu().contiguous()
+        #     energy, rotations = arap_cpp.compute_arap_energy(
+        #         vertices, original_vertices, neighbors, neighbor_mask, weights)
+        
+        # # Save everything needed for backward
+        # ctx.save_for_backward(vertices, original_vertices, neighbors, 
+        #                     neighbor_mask, rotations, weights, cuda)
+
         vertices = vertices.cpu().contiguous()
         original_vertices = original_vertices.cpu().contiguous()
         neighbors = neighbors.cpu().contiguous()
         neighbor_mask = neighbor_mask.cpu().contiguous()
-        
-        energy, rotations = arap_cpp.compute_arap_energy(
-            vertices, original_vertices, neighbors, neighbor_mask)
-        
-        # TODO: same here, check if padded neighbors and neighbor_mask are needed
+
+        energy, rotations = arap_cpp.compute_arap_energy(vertices, original_vertices, neighbors, neighbor_mask)
+
         # Save everything needed for backward
         ctx.save_for_backward(vertices, original_vertices, neighbors, 
                             neighbor_mask, rotations)
+        
         return energy.cuda()
 
     @staticmethod
     def backward(ctx, grad_output):
+        # vertices, original_vertices, neighbors, neighbor_mask, rotations, weights, cuda = ctx.saved_tensors
         vertices, original_vertices, neighbors, neighbor_mask, rotations = ctx.saved_tensors
         
-        # Compute gradients using C++ implementation
+        # if cuda:
+        #     grad_vertices = arap_cuda.compute_arap_gradient_cuda(
+        #         vertices, original_vertices, neighbors, neighbor_mask,
+        #         rotations, weights, grad_output)
+        # else:
+        #     grad_vertices = arap_cpp.compute_arap_gradient(
+        #         vertices, original_vertices, neighbors, neighbor_mask,
+        #         rotations, weights, grad_output)
+
         grad_vertices = arap_cpp.compute_arap_gradient(
             vertices, original_vertices, neighbors, neighbor_mask,
             rotations, grad_output)
@@ -551,8 +575,12 @@ class MeshAwareGaussianModel(GaussianModel):
 
         xyz, _ = self.compute_positions_and_normals(deform=False)
 
-        # Grey color init
-        rgb_norm = torch.tensor([0.5, 0.5, 0.5]).cuda()
+        # # Grey color init
+        # rgb_norm = torch.tensor([0.5, 0.5, 0.5]).cuda()
+
+        # Random color init
+        # TODO: experiment with this, grey init for some reason might yield slightly better results
+        rgb_norm = torch.rand((n_total_gaussians, 3), device="cuda")
 
         fused_color = RGB2SH(rgb_norm)
         features = torch.zeros((n_total_gaussians, 3, (self.max_sh_degree + 1) ** 2), device="cuda")
@@ -590,24 +618,35 @@ class MeshAwareGaussianModel(GaussianModel):
         #   Can then subtract to get all edge vectors, shape (#vertices, #max_neighbors, 3)
         self.original_edges = self.original_mesh_vertices.unsqueeze(1) - self.original_mesh_vertices[self.padded_neighbors]
 
+        # Keep some values on CPU for ARAP so we do not have to move them from GPU to CPU every time
+        self.original_vertices_cpu = self.original_mesh_vertices.cpu().contiguous()
+        self.neighbors_cpu = self.padded_neighbors.cpu().contiguous()
+        self.neighbor_mask_cpu = self.neighbor_mask.cpu().contiguous()
 
-    def setup_deformation_field(self, visibility_filter, mesh=None, registration=None):
+    def get_visible_faces_indices(self, visibility_filter):
         # Look up the parent triangles for each visible Gaussian
         parent_triangles = self._parent_faces[visibility_filter]
         # Check for unique parent triangles
         unique_parent_triangles = torch.unique(parent_triangles)
+        return unique_parent_triangles
+
+    def get_visible_vertices_indices(self, visibility_filter):
+        unique_parent_triangles = self.get_visible_faces_indices(visibility_filter)
 
         # Look up the relevant vertices for each parent triangle
         relevant_vertex_indices = self.mesh_faces[unique_parent_triangles]
         relevant_vertex_indices = relevant_vertex_indices.view(-1)
-        unique_relevant_vertices = torch.unique(relevant_vertex_indices)
+        unique_relevant_vertices_indices = torch.unique(relevant_vertex_indices)
 
-        print(f"shape of unique relevant vertices: {unique_relevant_vertices.shape}")
+        return unique_relevant_vertices_indices
+
+    def setup_deformation_field(self, visibility_filter, mesh=None, registration=None):
+        unique_relevant_vertices_indices = self.get_visible_vertices_indices(visibility_filter)
 
         # Initialize mesh deformation
         self.mesh_deformation = MeshSparseDeformation(
             self.original_mesh_vertices,
-            visible_vertices=unique_relevant_vertices,
+            visible_vertices=unique_relevant_vertices_indices,
             subsample=self.cfg['deform_network']['subsample'],
             k=self.cfg['deform_network']['k']
         )
@@ -885,46 +924,122 @@ class MeshAwareGaussianModel(GaussianModel):
         
         return arap_energy
         
-    def compute_arap_energy_cpp(self):
+    def compute_arap_energy_cpp(self, cuda, cotangent_weights, visibility_filter=None):
+        # if visibility_filter is not None:
+        #     print("Using visibility filter")
+        #     visible_vertices_indices = self.get_visible_vertices_indices(visibility_filter)
+
+        #     # Get all neighbors, flatten them, and keep only the ones that are masked with true
+        #     visible_neighbors = self.padded_neighbors[visible_vertices_indices].view(-1)
+        #     visible_neighbor_mask = self.neighbor_mask[visible_vertices_indices].view(-1)
+
+        #     visible_neighbors_masked = visible_neighbors[visible_neighbor_mask].view(-1)
+
+        #     # Concatenate all the visible vertices and neighbors and keep unique ones
+        #     visible_vertices_and_neighbors = torch.cat((visible_vertices_indices, visible_neighbors_masked), dim=0)
+        #     visible_vertices_and_neighbors = torch.unique(visible_vertices_and_neighbors)
+
+        #     # Create mapping from old vertex indices to new compressed indices
+        #     old_to_new = torch.full((self.original_mesh_vertices.shape[0],), -1, device='cuda')
+        #     # For example, what used to be vertex 10 but is the first visible vertex is now vertex 0
+        #     old_to_new[visible_vertices_and_neighbors] = torch.arange(len(visible_vertices_and_neighbors), device='cuda')
+
+        # # Apply deformation
+        # curr_pos = self.mesh_deformation(self.original_mesh_vertices)
+
+        # if cotangent_weights:
+        #     # TODO: adapt this to the visibility filter
+        #     print("Computing cotangent weights")
+        #     weights = self.mesh_deformation.compute_cotangent_weights(self.current_mesh_vertices, self.mesh_faces)
+        # else:
+        #     print("Using uniform weights")
+        #     # Uniform weights
+        #     if visibility_filter is not None:
+        #         weights = torch.ones((visible_vertices_and_neighbors.shape[0], visible_vertices_and_neighbors.shape[0]))
+        #     else:
+        #         weights = torch.ones((self.original_mesh_vertices.shape[0], self.original_mesh_vertices.shape[0]))
+        #     if cuda:
+        #         weights = weights.to("cuda")
+
+        # if cuda:
+        #     # TODO: adapt this to the visibility filter
+        #     return ArapFunction.apply(curr_pos, 
+        #                 self.original_mesh_vertices,
+        #                 self.padded_neighbors,
+        #                 self.neighbor_mask,
+        #                 weights,
+        #                 cuda)
+        # else:
+        #     if visibility_filter is not None:
+        #         # Take only visible, deformed vertices
+        #         curr_pos = curr_pos[visible_vertices_and_neighbors]
+
+        #         # Move relevant tensors to the cpu
+        #         visible_vertices_and_neighbors = visible_vertices_and_neighbors.cpu()
+        #         visible_vertices_indices = visible_vertices_indices.cpu()
+        #         old_to_new = old_to_new.cpu()
+
+        #         # TODO: make contiguous?
+        #         # Get the original, corresponding vertices
+        #         original_vertices_cpu = self.original_mesh_vertices[visible_vertices_and_neighbors]
+
+        #         # Remap relevant neighbors, neighbor mask is just boolean mask
+        #         neighbor_mask_cpu = self.neighbor_mask_cpu[visible_vertices_indices]
+        #         neighbors_cpu = old_to_new[self.neighbors_cpu[visible_vertices_indices]]
+        #     else:
+        #         print("Sticking to the original vertices, neighbors, and mask")
+        #         original_vertices_cpu = self.original_vertices_cpu
+        #         neighbors_cpu = self.neighbors_cpu
+        #         neighbor_mask_cpu = self.neighbor_mask_cpu
+
+        #     return ArapFunction.apply(curr_pos, 
+        #                     original_vertices_cpu,
+        #                     neighbors_cpu,
+        #                     neighbor_mask_cpu,
+        #                     weights,
+        #                     cuda)
+
         curr_pos = self.mesh_deformation(self.original_mesh_vertices)
         return ArapFunction.apply(curr_pos, 
                         self.original_mesh_vertices,
                         self.padded_neighbors,
                         self.neighbor_mask)
+            
         
     def compute_regularization(self, visibility_filter):
-        # arap_energy = self.compute_arap_energy_cpp()
-        arap_energy = torch.tensor(0, device="cuda")
+        if self.cfg['ARAP']['active']:
+            cuda_accelerated = self.cfg['ARAP']['CUDA']
+            cotangent_weights = self.cfg['ARAP']['cotangent_weights']
+            # Not passing the visibility filter for now
+            arap_energy = self.compute_arap_energy_cpp(cuda=cuda_accelerated, cotangent_weights=cotangent_weights)
+        else:
+            arap_energy = torch.tensor(0, device="cuda")
+
+        # Waiting for CUDA operations to finish
+        torch.cuda.synchronize()
 
         # scale_loss = torch.max(self.scaling_activation(self._scaling), self.scaling_activation(self.original_scales)).mean()
         scale_loss = torch.tensor(0, device="cuda")
 
         # E_rigid_loc punishes changes in relative position between control vertices and their k nearest neighbors
         rigid_loc_loss = self.mesh_deformation.compute_rigid_loc_loss()
+        # rigid_loc_loss = torch.tensor(0, device="cuda")
 
         # E_rigid_rot punishes changes in relative rotation between control vertices and their k nearest neighbors
-        rigid_rot_loss = self.mesh_deformation.compute_rigid_rot_loss()
+        # rigid_rot_loss = self.mesh_deformation.compute_rigid_rot_loss()
+        rigid_rot_loss = torch.tensor(0, device="cuda")
 
         # E_iso is a relaxed version of E_rigid_loc, punishing changes in relative distance unrelated to direction
-        iso_loss = self.mesh_deformation.compute_iso_loss()
+        # iso_loss = self.mesh_deformation.compute_iso_loss()
+        iso_loss = torch.tensor(0, device="cuda")
 
-        # Add visibility loss, punish deformations on vertices that are not visible
-        invisible_parent_triangles = self._parent_faces[~visibility_filter].unique()
-        invisible_vertices = self.mesh_faces[invisible_parent_triangles].unique()
-        invisible_vertices = invisible_vertices.view(-1)
-        visibility_loss = torch.linalg.norm(self.current_mesh_vertices[invisible_vertices] - self.original_mesh_vertices[invisible_vertices], dim=1).mean()
+        invisible_vertices_indices = self.get_visible_vertices_indices(~visibility_filter)
+        visibility_loss = torch.linalg.norm(self.current_mesh_vertices[invisible_vertices_indices] - self.original_mesh_vertices[invisible_vertices_indices], dim=1).mean()
+        # visibility_loss = torch.tensor(0, device="cuda")
         
         return arap_energy, scale_loss, rigid_loc_loss, rigid_rot_loss, iso_loss, visibility_loss
 
     def build_neighbors(self, faces):
-        # Load torch tensors from a file if they exist
-        # TODO: hack to debug faster, remove later
-        if os.path.exists("padded_neighbors.pt") and os.path.exists("neighbor_mask.pt"):
-            print("Loading padded_neighbors and neighbor_mask from file")
-            padded_neighbors = torch.load("padded_neighbors.pt")
-            neighbor_mask = torch.load("neighbor_mask.pt")
-            return padded_neighbors, neighbor_mask
-        
         num_vertices = self.current_mesh_vertices.shape[0]
         
         # Create adjacency lists
@@ -933,12 +1048,12 @@ class MeshAwareGaussianModel(GaussianModel):
         # Each face is [v0, v1, v2]. Add edges both ways.
         for f in faces:
             v0, v1, v2 = f
-            adjacency[v0].append(v1)
-            adjacency[v0].append(v2)
-            adjacency[v1].append(v0)
-            adjacency[v1].append(v2)
-            adjacency[v2].append(v0)
-            adjacency[v2].append(v1)
+            adjacency[v0].append(v1.item())
+            adjacency[v0].append(v2.item())
+            adjacency[v1].append(v0.item())
+            adjacency[v1].append(v2.item())
+            adjacency[v2].append(v0.item())
+            adjacency[v2].append(v1.item())
         
         # Remove duplicates
         for i in range(num_vertices):
@@ -954,11 +1069,6 @@ class MeshAwareGaussianModel(GaussianModel):
             padded_neighbors[i, :len(n_list)] = torch.tensor(n_list, device='cuda', dtype=torch.long)
             neighbor_mask[i, :len(n_list)] = True
 
-        # Save torch tensors to a file
-        print("Saving padded_neighbors and neighbor_mask to file")
-        torch.save(padded_neighbors, "padded_neighbors.pt")
-        torch.save(neighbor_mask, "neighbor_mask.pt")
-        
         return padded_neighbors, neighbor_mask
 
 

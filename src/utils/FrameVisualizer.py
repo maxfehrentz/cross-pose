@@ -58,6 +58,7 @@ class FrameVisualizer(object):
                          render_pkg['deformed_surface'], relative_deformed_depth)
         outmap = os.path.join(self.outmap,f'{idx:05d}.jpg')
         plt.savefig(outmap, bbox_inches='tight', pad_inches=0.2, dpi=300)
+        plt.close()
 
         # Create two more figures, alpha blending the rendered image, the deformed mesh and the original mesh, both are already images
         alpha = 0.25
@@ -95,8 +96,8 @@ class FrameVisualizer(object):
         return outmap, outsem
     
     def save_mesh_deformations(self, idx, c2w, mesh, deformed_mesh, registration, control_vertices, control_def):
-        self.camera.set_c2w(c2w)
-        deformation_vis = render_mesh_deformations(self.camera, mesh, deformed_mesh, registration, control_vertices, control_def)
+        self.widefield_camera.set_c2w(c2w)
+        deformation_vis = render_mesh_deformations(self.widefield_camera, mesh, deformed_mesh, registration, control_vertices, control_def)
         outdeformation = os.path.join(self.outdeformation, f'{idx:05d}.jpg')
         imsave(outdeformation, deformation_vis)
 
@@ -185,7 +186,7 @@ class FrameVisualizer(object):
     def plot_semantics(self, c2w, thr=0.8):
         self.widefield_camera.set_c2w(c2w)
         self.camera.set_c2w(c2w)
-        render_pkg = render(self.widefield_camera, self.net, self.background)
+        render_pkg = render(self.camera, self.net, self.background)
         # mask gaussians that are in areas with very low opacity
         render_pkg['render'][render_pkg['alpha'] < thr] = 0.0
         semantics = torch.argmax(render_pkg['semantics'], dim=0)

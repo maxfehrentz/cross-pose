@@ -62,8 +62,8 @@ def render_mesh_deformations(viewpoint_camera, mesh, deformed_mesh, registration
     # Make copy of the mesh to not modify the original mesh
     mesh_copy = mesh.copy()
 
-    # Add the mesh to the plotter
-    add_mesh_to_plotter(mesh_copy, registration, plotter, opacity=0.5)
+    # # Add the mesh to the plotter
+    # add_mesh_to_plotter(mesh_copy, registration, plotter, opacity=0.5)
 
     # Add the deformed mesh to the plotter as wireframe, registration is identity
     add_mesh_to_plotter(deformed_mesh, torch.eye(4), plotter, wireframe=True)
@@ -74,8 +74,10 @@ def render_mesh_deformations(viewpoint_camera, mesh, deformed_mesh, registration
     cam = plotter.camera
     # Get intrinsics and set them in the vtk camera as well, converting radians to degrees
     cam.view_angle = viewpoint_camera.FoVy * 180 / math.pi
-    # Zoom out slightly
-    cam.zoom(.6)
+
+    # # Zoom out slightly
+    # cam.zoom(.6)
+    
     plotter.camera = cam
     
     # Compute deformation magnitude for each control point
@@ -94,37 +96,38 @@ def render_mesh_deformations(viewpoint_camera, mesh, deformed_mesh, registration
     points = pv.PolyData(control_vertices.numpy())
     points["deformation"] = deform_magnitudes
     
-    # # Add arrows at control points, showing deformation direction and magnitude
-    # points["vectors"] = control_def  # Add vectors as point data
-    # _ = plotter.add_mesh(
-    #     points.glyph(
-    #         orient=True,  # Use vectors for orientation
-    #         scale='deformation',  # Scale by deformation magnitude
-    #         factor=0.1,  # Scale factor for arrows
-    #         geom=pv.Arrow(  # Arrow glyph settings
-    #             shaft_radius=0.01,
-    #             tip_radius=0.03,
-    #             tip_length=0.05
-    #         )
-    #     ),
-    #     scalars='deformation',
-    #     cmap='RdYlGn_r',  # Red (high deformation) to Green (low deformation)
-    #     clim=[0, 1],
-    #     show_scalar_bar=True,
-    #     scalar_bar_args={'title': 'Deformation Magnitude'}
-    # )
+    # Add arrows at control points, showing deformation direction and magnitude
+    points["vectors"] = control_def  # Add vectors as point data
+    _ = plotter.add_mesh(
+        points.glyph(
+            orient=True,  # Use vectors for orientation
+            scale='deformation',  # Scale by deformation magnitude
+            factor=0.05,  # Scale factor for arrows
+            geom=pv.Arrow(  # Arrow glyph settings
+                shaft_radius=0.01,
+                tip_radius=0.03,
+                tip_length=0.05
+            )
+        ),
+        scalars='deformation',
+        cmap='RdYlGn_r',  # Red (high deformation) to Green (low deformation)
+        clim=[0, 1],
+        show_scalar_bar=False,
+        scalar_bar_args={'title': 'Deformation Magnitude'}
+    )
 
-    # # Add spheres at control points
-    # _ = plotter.add_mesh(
-    #     points.glyph(
-    #         scale=False,  # Don't scale by magnitude
-    #         geom=pv.Sphere(radius=0.001),  # Fixed size spheres
-    #     ),
-    #     scalars="deformation",
-    #     cmap='RdYlGn_r',  # Red (high deformation) to Green (low deformation)
-    #     clim=[0, 1],
-    #     opacity=0.8  # Slightly transparent to see arrows better
-    # )
+    # Add spheres at control points
+    _ = plotter.add_mesh(
+        points.glyph(
+            scale=False,  # Don't scale by magnitude
+            geom=pv.Sphere(radius=0.0025),  # Fixed size spheres
+        ),
+        scalars="deformation",
+        cmap='RdYlGn_r',  # Red (high deformation) to Green (low deformation)
+        clim=[0, 1],
+        show_scalar_bar=False,
+        opacity=0.8  # Slightly transparent to see arrows better
+    )
 
     plotter.show()
     # Render and get image

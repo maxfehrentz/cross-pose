@@ -13,3 +13,7 @@ data:
   transforms: /home/fsc/max/Data/Pigs/pig7/dynamic_breathing_half_res/transforms.json
   mesh: /home/fsc/max/Data/Pigs/pig7/ImFusionExport_abdominal_cavity_coarse.obj
   output: output/ATLAS/pig7/dynamic_breathing
+
+model:
+  ARAP:
+    active: True

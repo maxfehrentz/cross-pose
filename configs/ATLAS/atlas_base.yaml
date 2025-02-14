@@ -9,7 +9,7 @@ training:
   w_depth: 10 # default: 10
   w_color: 5 # default: 5
   w_def:
-    w_arap: 1 # TODO: figure that out
+    w_arap: .001 # TODO: figure that out
     w_scale: 100 # TODO: figure that out
   feature_lr: 0.0025 # default: 0.0025
   barycentric_coords_lr: .01
@@ -31,3 +31,7 @@ model:
   deform_network:
     subsample: 8 # default: 32
     k: 15 # default: 25
+  ARAP:
+    active: True
+    cotangent_weights: False
+    CUDA: False

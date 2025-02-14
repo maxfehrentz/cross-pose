@@ -52,6 +52,8 @@ class SceneOptimizer():
         # self.net = GaussianModel(cfg=cfg['model'])
         self.net = MeshAwareGaussianModel(cfg=cfg['model'])
         self.camera = Camera(cfg['cam'])
+        if self.cfg['model']['ARAP']['active']:
+            self.output = f"{self.output}_ARAP"
         self.visualizer = FrameVisualizer(self.output, cfg, self.net)
 
         self.log_freq = args.log_freq

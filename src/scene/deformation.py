@@ -287,6 +287,61 @@ class MeshSparseDeformation(nn.Module):
             self.mean_cache[1] = self.mean_cache[0].detach()
         self.mean_cache[0] = vertices_deformed
         return vertices_deformed
+    
+    def compute_cotangent_weights(self, vertices, faces):
+        """
+        Compute cotangent weights for mesh edges.
+        For each edge (i,j), weight_ij = (cot α + cot β)/2
+        where α and β are the angles opposite to the edge in the two adjacent triangles.
+        """
+        
+        # For each face, compute all three edges; shaped [n_faces, 3]
+        e1 = vertices[faces[:, 1]] - vertices[faces[:, 0]]
+        e2 = vertices[faces[:, 2]] - vertices[faces[:, 1]]
+        e3 = vertices[faces[:, 0]] - vertices[faces[:, 2]]
+        
+        # Compute angles using dot product; have to use minus because the vectors should both point outwards but the way we compute the edges
+        #  means that one points inwards and the other outwards
+        # Result is shaped [n_faces, 3]
+        unnormalized_cos_angles = torch.stack([
+            torch.sum(-e3 * e1, dim=1),
+            torch.sum(-e1 * e2, dim=1),
+            torch.sum(-e2 * e3, dim=1) 
+        ], dim=1)
+        
+        # Compute all lengths
+        len_e1 = torch.norm(e1, dim=1)
+        len_e2 = torch.norm(e2, dim=1)
+        len_e3 = torch.norm(e3, dim=1)
+
+        # Have to normalize, since cos(angle) = dot product / (norm(e1) * norm(e2))
+        cos_angles = torch.stack([
+            unnormalized_cos_angles[:, 0] / (len_e3 * len_e1),
+            unnormalized_cos_angles[:, 1] / (len_e1 * len_e2),
+            unnormalized_cos_angles[:, 2] / (len_e2 * len_e3) 
+        ], dim=1)
+
+        # Clamping for numerical stability
+        cos_angles = torch.clamp(cos_angles, -0.999999, 0.999999)
+
+        # Computing cotangents, since cot(angle) = cos(angle) / sin(angle) = 1 / tan(angle) = 1 / tan(arccos(cos(angle)))
+        cotangents = 1.0 / torch.tan(torch.acos(cos_angles))
+        
+        # Create matrix of weights
+        n_vertices = vertices.shape[0]
+        weights = torch.zeros((n_vertices, n_vertices), device=vertices.device)
+        
+        # Weights are 0.5 * cotangent_alpha + 0.5 * cotangent_beta where alpha and beta are the angles opposite to the edge
+        for i in range(3):
+            j = (i + 1) % 3
+            # Get the vertex indices for the edge
+            idx_i = faces[:, i]
+            idx_j = faces[:, j]
+            # Add the cotangent weights for the edge
+            weights[idx_i, idx_j] += 0.5 * cotangents[:, (j - 1) % 3]
+            weights[idx_j, idx_i] += 0.5 * cotangents[:, (j - 1) % 3]
+            
+        return weights
 
     def compute_rigid_loc_loss(self):
         if self.mean_cache[1] is None:

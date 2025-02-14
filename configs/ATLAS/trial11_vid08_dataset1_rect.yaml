@@ -12,3 +12,7 @@ data:
   transforms: /home/fsc/max/Data/Pigs/trial11/dataset1_rect/reduced_tranforms.json
   mesh: /home/fsc/max/Data/Pigs/trial11/CT/cavity_minimal_cleaned_3.obj
   output: output/ATLAS/trial11_vid08/dataset1_rect
+
+model:
+  ARAP:
+    active: True

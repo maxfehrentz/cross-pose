@@ -1,6 +1,6 @@
 from setuptools import setup
 # Pytorch's C++ tools
-from torch.utils.cpp_extension import BuildExtension, CppExtension
+from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension
 import os
 
 # Set OpenMP flags which compiler to use
@@ -28,3 +28,27 @@ setup(
         'build_ext': BuildExtension
     }
 )
+
+# # CUDA extension
+# setup(
+#     name='arap_cuda',
+#     ext_modules=[
+#         CUDAExtension(
+#             name='arap_cuda',
+#             sources=[
+#                 'arap_cuda.cpp',
+#                 'arap_cuda_kernels.cu'
+#             ],
+#             extra_compile_args={
+#                 'cxx': ['-g'],
+#                 'nvcc': ['-O2']
+#             },
+#             library_dirs=['/usr/local/cuda/lib64'],  # Point to system CUDA
+#             include_dirs=['/usr/local/cuda/include'],  # Point to system CUDA headers
+#             libraries=['cusolver']
+#         )
+#     ],
+#     cmdclass={
+#         'build_ext': BuildExtension
+#     }
+# )
