@@ -1,0 +1,7 @@
+inherit_from: configs/SOFA/sofa_liver.yaml
+
+data:
+  image_input_folder: /home/fsc/max/Data/Synthetic/liver_down
+  mesh: /home/fsc/max/Data/Synthetic/liver_down/mesh_0000.obj
+  transforms: /home/fsc/max/Data/Synthetic/liver_down/transforms.json
+  output: output/SOFA/liver_down

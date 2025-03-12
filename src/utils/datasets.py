@@ -11,9 +11,10 @@ from src.utils.semantic_utils import SemanticDecoder
 from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES, FLIP_CAM_AXES
 
 
-class Atlas(Dataset):
+# Currently one class for ATLAS (clinical) and SOFA (simulated)
+class MonoMeshMIS(Dataset):
     def __init__(self, cfg, args, scale):
-        super(Atlas, self).__init__()
+        super(MonoMeshMIS, self).__init__()
         self.name = cfg['dataset']
 
         self.scale = scale
@@ -21,11 +22,7 @@ class Atlas(Dataset):
         self.transforms_path = cfg['data']['transforms']
 
         # Load cameras and image and mask paths
-        self.poses, self.color_paths, self.mask_paths, self.seg_paths, self.registration_matrices = self.load_cams_and_filepaths(self.transforms_path)
-
-        # TODO: what about semantic decoder? ignore for now
-        # self.semantic_decoder = SemanticDecoder()
-
+        self.poses, self.color_paths, self.mask_paths, self.seg_paths, self.registration_matrices, self.gt_mesh_paths = self.load_cams_and_filepaths(self.transforms_path)
         return
 
 
@@ -39,6 +36,8 @@ class Atlas(Dataset):
         color_paths = [os.path.join(self.input_folder, frame['file_path']) for frame in frames]
         mask_paths = [os.path.join(self.input_folder, frame['mask_path']) if 'mask_path' in frame and frame['mask_path'] is not None else None for frame in frames]
         seg_paths = [os.path.join(self.input_folder, frame['segmentation_path']) if 'segmentation_path' in frame and frame['segmentation_path'] is not None else None for frame in frames]
+        gt_mesh_paths = [os.path.join(self.input_folder, frame['def_gt']) if 'def_gt' in frame and frame['def_gt'] is not None else None for frame in frames]
+
         poses = np.array([frame['transform_matrix'] for frame in frames], dtype=float)
         poses = torch.from_numpy(poses).float()
         registration_matrices = np.array([frame['mesh_matrix'] for frame in frames], dtype=float)
@@ -66,7 +65,7 @@ class Atlas(Dataset):
         # Reorient world space
         poses = SWAP_AND_FLIP_WORLD_AXES @ poses
 
-        return poses, color_paths, mask_paths, seg_paths, registration_matrices
+        return poses, color_paths, mask_paths, seg_paths, registration_matrices, gt_mesh_paths
 
 
     def __getitem__(self, index):
@@ -105,8 +104,8 @@ class Atlas(Dataset):
         pose = self.poses[index]
         registration_matrix = self.registration_matrices[index]
         intrinsics = self.intrinsics[index]
-
-        return index, color_data, None, pose, registration_matrix, mask_data, semantics, intrinsics
+        gt_mesh_path = self.gt_mesh_paths[index]
+        return index, color_data, None, pose, registration_matrix, mask_data, semantics, intrinsics, gt_mesh_path
     
     def __len__(self):
         return len(self.poses)

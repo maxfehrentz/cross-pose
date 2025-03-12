@@ -1,0 +1,14 @@
+inherit_from: configs/SOFA/sofa_base.yaml
+cam:
+  H: 1080
+  W: 1850
+  fx: 1303.6753236814714
+  fy: 1303.6753236814714
+  cx: 925
+  cy: 540
+
+data:
+  image_input_folder: /home/fsc/max/Data/Synthetic/liver_original_force
+  mesh: /home/fsc/max/Data/Synthetic/liver_original_force/mesh_0004.obj
+  transforms: /home/fsc/max/Data/Synthetic/liver_original_force/transforms.json
+  output: output/SOFA/liver_original_force

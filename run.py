@@ -8,16 +8,16 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 import pickle
 from torch.utils.data import DataLoader
+from src.utils.CT_reader import read_ct_volume
 from src.utils.camera import Camera
 from src.utils.FrameVisualizer import FrameVisualizer
-from src.utils.flow_utils import get_scene_flow, get_depth_from_raft
-from src.utils.PointTracker import PointTracker, mte, surv_2d, delta_2d
-from src.utils.datasets import StereoMIS, Atlas
+from src.utils.flow_utils import get_depth_from_raft
+from src.utils.datasets import MonoMeshMIS
 from src.utils.loss_utils import l1_loss
 from src.utils.renderer import render
-from src.scene.gaussian_model import GaussianModel, MeshAwareGaussianModel
-from src.utils.mesh_utils import preprocess_mesh
-from src.utils.transform_utils import SCALE, SWAP_AND_FLIP_WORLD_AXES
+from src.scene.gaussian_model import MeshAwareGaussianModel
+from src.utils.mesh_utils import preprocess_mesh, undo_preprocess_mesh, undo_register_mesh
+from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES
 
 # For Depth Anything V2
 import cv2
@@ -34,6 +34,9 @@ from torch.profiler import profile, record_function, ProfilerActivity
 # Initialize tensorboard writer
 from torch.utils.tensorboard import SummaryWriter
 
+# For VTK
+import vtk
+
 
 class SceneOptimizer():
     def __init__(self, cfg, args):
@@ -41,11 +44,12 @@ class SceneOptimizer():
         self.cfg = cfg
         self.args = args
         self.visualize = args.visualize
-        self.scale = SCALE
+        self.eval = cfg['eval']
+        self.scale = cfg['scale']
         self.device = cfg['device']
         self.output = cfg['data']['output']
 
-        self.frame_reader = Atlas(cfg, args, scale=self.scale)
+        self.frame_reader = MonoMeshMIS(cfg, args, scale=self.scale)
         # self.frame_reader = StereoMIS(cfg, args, scale=self.scale)
         self.n_img = len(self.frame_reader)
         self.frame_loader = DataLoader(self.frame_reader, batch_size=1, num_workers=0 if args.debug else 4)
@@ -66,14 +70,6 @@ class SceneOptimizer():
         self.background = torch.tensor([0,0,0], dtype=torch.float32, device="cuda")
         self.dbg = args.debug
 
-        self.pt_tracker = None
-        # track_file = os.path.join(cfg['data']['input_folder'], 'track_pts.pckl')
-        # if os.path.isfile(track_file):
-        #     self.pt_tracker = PointTracker(cfg, self.net, track_file)
-        # self.last_frame = None
-        # self.raft = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False).to(self.device)
-        # self.raft = self.raft.eval()
-
         # Checking for baseline, not available if monocular dataset
         self.baseline = cfg['cam'].get('stereo_baseline', None)
         if self.baseline is not None:
@@ -84,8 +80,8 @@ class SceneOptimizer():
         # Load mesh
         if self.mesh is not None:
             self.mesh = pv.read(self.mesh)
-            # Preprocesses mesh in place
-            preprocess_mesh(self.mesh)
+            # Preprocesses mesh in place; dataset is relevant as different datasets have different mesh coordinate system conventions
+            preprocess_mesh(self.mesh, dataset=self.cfg['dataset'])
 
         # Initialize Depth Anything V2 model
         model_configs = {
@@ -101,6 +97,15 @@ class SceneOptimizer():
         # Initialize tensorboard writer
         self.writer = SummaryWriter(os.path.join(self.output, 'tensorboard'))
 
+        # Load CT if provided
+        self.ct_volume = None
+        # Safely check if key exists in cfg['data']
+        CT_folder = cfg['data'].get('CT', None)
+        if self.visualize and CT_folder is not None:
+            # Contains volumetric and metadata, check method for details
+            self.ct_volume = read_ct_volume(CT_folder)
+
+
     def fit(self, frame, iters, incremental):
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA, ProfilerActivity.XPU]) as prof:
         self.net.reset_optimizer()
@@ -114,7 +119,7 @@ class SceneOptimizer():
             self.net.train(iter == 1)
 
             with record_function("render"):
-                render_pkg = render(self.camera, self.net, self.background, deform=incremental)
+                render_pkg = render(self.camera, self.net, self.background, self.scale, deform=incremental)
             self.net.eval()
             color = render_pkg['render'][None, ...]
             depth = render_pkg['depth'][None, ...]
@@ -125,9 +130,7 @@ class SceneOptimizer():
             # Loss
             with record_function("photometric loss computation"):
                 Ll1 = self.cfg['training']['w_color']*l1_loss(color[tool_mask], gt_color[tool_mask])
-                # Ll1_depth = self.cfg['training']['w_depth']*l1_loss(depth[tool_mask], gt_depth[tool_mask])
 
-            # loss = Ll1 + Ll1_depth
             loss = Ll1
 
             if isinstance(self.net, MeshAwareGaussianModel):
@@ -199,7 +202,7 @@ class SceneOptimizer():
         #  but from the optimization in the world space of the Gaussians. Need to apply the same transform
         #  (or rather its inverse) to go back to the original mesh space that this rendering assumes
         transform = SWAP_AND_FLIP_WORLD_AXES
-        deformed_vertices = (transform[:3, :3] @ deformed_vertices.T).T / SCALE
+        deformed_vertices = (transform[:3, :3] @ deformed_vertices.T).T / self.scale
         # Ensure array is contiguous and in the correct dtype
         deformed_vertices = np.ascontiguousarray(deformed_vertices, dtype=np.float32)
         deformed_mesh.points = deformed_vertices
@@ -208,7 +211,7 @@ class SceneOptimizer():
         deformed_mesh.compute_normals(
             cell_normals=False,
             point_normals=True,
-            split_vertices=True,  # Crucial here, otherwise normals are not computed correctly
+            split_vertices=False,  # Looks better with True, but causes issues with number of vertices
             inplace=True
         )
 
@@ -217,9 +220,14 @@ class SceneOptimizer():
 
     def run(self):
         torch.cuda.empty_cache()
-        pt_track_stats = {"pred_2d": []}
 
-        for ids, gt_color, gt_color_r, gt_c2w, registration, tool_mask, semantics, intrinsics in tqdm(self.frame_loader, total=self.n_img):
+        # Collect metrics for evaluation, e.g., when ground truth meshes are available
+        if self.eval:   
+            mesh_error_l2 = []
+            mesh_error_std = []
+            global_max_error = 0
+
+        for ids, gt_color, gt_color_r, gt_c2w, registration, tool_mask, semantics, intrinsics, gt_mesh_path in tqdm(self.frame_loader, total=self.n_img):
             gt_color = gt_color.cuda()
             gt_color_r = gt_color_r.cuda() if gt_color_r is not None else None
             gt_c2w = gt_c2w.cuda()
@@ -257,26 +265,27 @@ class SceneOptimizer():
                 # Note that we are using the matrix coming from the first frame; some datasets provide a registration
                 #  matrix for each frame, but we are using the first frame's matrix for all frames since they do not
                 #  change significantly unless the operating table is moved
-                self.net.create_from_mesh(self.mesh.copy(), registration, gt_depth)
+                self.net.create_from_mesh(self.mesh.copy(), registration, gt_depth, self.scale)
 
                 # Render once to check for visibility filter and initialize the deformation field based on that
                 with torch.no_grad():
                     self.camera.set_c2w(gt_c2w)
-                    render_pkg = render(self.camera, self.net, self.background, deform=False)
+                    render_pkg = render(self.camera, self.net, self.background, self.scale, deform=False)
                     visibility_filter = render_pkg['visibility_filter']
                     self.net.setup_deformation_field(visibility_filter, self.mesh.copy())
+
+                # Save the original mesh without any preprocessing
+                slicer_mesh = self.mesh.copy()
+                undo_preprocess_mesh(slicer_mesh, self.cfg['dataset'])
+                np.savetxt(f'{self.output}/original_mesh_vertices.txt', slicer_mesh.points[self.net.mesh_deformation.control_ids.cpu().numpy(), :])
+                pv.save_meshio(f'{self.output}/original_mesh.obj', slicer_mesh)
 
                 # Setup for training
                 self.net.training_setup(self.cfg['training'])
                 # Fit first frame
                 self.fit(frame, iters=self.cfg['training']['iters_first'], incremental=True)
             else:
-                if ids.item() == 1:
-                    if self.cfg['training']['grad_weighing']:
-                        self.net.enable_grad_weighing(True)
                 self.fit(frame, iters=self.cfg['training']['iters'], incremental=True)
-
-            self.last_frame = gt_color.detach()
 
             # eval
             with torch.no_grad():
@@ -287,17 +296,103 @@ class SceneOptimizer():
                     # Get the deformed mesh from the Gaussian model
                     deformed_mesh = self.get_deformed_mesh(mesh_copy, self.net) if self.mesh is not None else None
                     
-                    # Get the current deformation control vertices and their deformation values, then visualize them by rendering the mesh, the deformed mesh, and add vectors to the control vertices
+                    # Get the current deformation control vertices and their deformation values, then visualize them
                     control_vertices_indices = self.net.mesh_deformation.control_ids
                     control_vertices = self.net.original_mesh_vertices[control_vertices_indices].detach().cpu().numpy()
                     control_def = self.net.mesh_deformation.control_def.detach().cpu().numpy()
 
-                    outmap, outsem = self.visualizer.save_imgs(ids.item(), gt_depth, gt_color,
-                                                                        gt_c2w, mesh=mesh_copy,
-                                                                        registration=registration, deformed_mesh=deformed_mesh)
-                    # Render and save the deformations
-                    self.visualizer.save_mesh_deformations(ids.item(), gt_c2w, mesh_copy, deformed_mesh, registration, control_vertices, control_def)
+                    # Save the deformed mesh
+                    if deformed_mesh is not None:
+                        # Modifies in place, have to create a copy
+                        slicer_deformed_mesh = deformed_mesh.copy()
+                        # We have to go back to the original mesh/CT space; the registration was applied in the Gaussian model, have to go back
+                        undo_register_mesh(slicer_deformed_mesh, registration)
+                        undo_preprocess_mesh(slicer_deformed_mesh, self.cfg['dataset'])
+                        np.savetxt(f'{self.output}/deformed_vertices_{ids.item()}.txt', slicer_deformed_mesh.points[control_vertices_indices.cpu().numpy(), :])
+                        pv.save_meshio(f'{self.output}/deformed_mesh_{ids.item()}.obj', slicer_deformed_mesh)
 
+                    # General visualization of the current iteration
+                    _, _ = self.visualizer.save_imgs(ids.item(), gt_depth, gt_color,
+                                                                        gt_c2w, self.scale, mesh=mesh_copy,
+                                                                        registration=registration, deformed_mesh=deformed_mesh)
+                    # Visualization of the deformations in particular
+                    self.visualizer.save_mesh_deformations(ids.item(), gt_c2w, mesh_copy, deformed_mesh, registration, control_vertices, control_def, self.scale)
+
+                    if self.ct_volume is not None:
+                        if ids.item() == 0: 
+                            # Save some slices from different orientations
+                            self.visualizer.visualize_ct_slice(
+                                self.ct_volume['image'],
+                                axis=2,
+                                filename=f'ct_axial_middle.png'
+                            )
+                            self.visualizer.visualize_ct_slice(
+                                self.ct_volume['image'],
+                                axis=1,
+                                filename=f'ct_coronal_middle.png'
+                            )
+                            self.visualizer.visualize_ct_slice(
+                                self.ct_volume['image'],
+                                axis=0,
+                                filename=f'ct_sagittal_middle.png'
+                            )
+                        
+                        # Warp the CT based on the deformed mesh
+                        try:
+                            warped_ct = self.visualizer.warp_ct_volume(self.ct_volume, slicer_deformed_mesh.copy(), slicer_mesh.copy(), control_vertices_indices.cpu().numpy())
+                            
+                            # Save slices of the warped CT
+                            self.visualizer.visualize_ct_slice(
+                                warped_ct,
+                                axis=2,
+                                filename=f'warped_ct_axial_middle_{ids.item()}.png'
+                            )
+                            self.visualizer.visualize_ct_slice(
+                                warped_ct,
+                                axis=1,
+                                filename=f'warped_ct_coronal_middle_{ids.item()}.png'
+                            )
+                            self.visualizer.visualize_ct_slice(
+                                warped_ct,
+                                axis=0,
+                                filename=f'warped_ct_sagittal_middle_{ids.item()}.png'
+                            )
+                        except Exception as e:
+                            print(f"Error during warping: {e}")
+                            import traceback
+                            traceback.print_exc()
+
+                if self.eval:
+                    # Load the ground truth mesh
+                    # Have to use the first element because of this DataLoader unexpected behavior: https://stackoverflow.com/questions/64883998/pytorch-dataloader-shows-odd-behavior-with-string-dataset
+                    gt_mesh = pv.read(gt_mesh_path[0])
+
+                    # TODO: fix this later, can lead to crash if self.visualize is False because the slicer_deformed_mesh is not available
+                    deformed_points = slicer_deformed_mesh.points
+                    gt_points = gt_mesh.points
+                    diff_vertices = deformed_points - gt_points
+                    l2_norms = np.linalg.norm(diff_vertices, axis=1)
+
+                    # Mean and std of the L2 norms
+                    mean_l2_error = np.mean(l2_norms)
+                    std_l2_error = np.std(l2_norms)
+                    max_l2_error = np.max(l2_norms)
+
+                    print(f"Frame {ids.item()}:")
+                    print(f'Mean L2 error: {mean_l2_error}')
+                    print(f'Std L2 error: {std_l2_error}')
+                    print(f'Max L2 error: {max_l2_error}\n')
+
+                    mesh_error_l2.append(mean_l2_error)
+                    mesh_error_std.append(std_l2_error)
+                    if max_l2_error > global_max_error:
+                        global_max_error = max_l2_error
+
+        if self.eval:
+            print(f"Global metrics over all frames:")
+            print(f'Mean L2 error: {np.mean(mesh_error_l2)}')
+            print(f'Std L2 error: {np.mean(mesh_error_std)}')
+            print(f'Max L2 error: {global_max_error}')
         print('...finished')
 
 

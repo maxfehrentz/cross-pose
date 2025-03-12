@@ -3,7 +3,7 @@ from torch import nn
 import numpy as np
 from src.utils.sh_utils import RGB2SH
 from src.utils.mesh_utils import register_mesh
-from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES, SCALE
+from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES
 from simple_knn._C import distCUDA2
 from src.utils.general_utils import strip_symmetric, build_scaling_rotation, build_inv_cov, inverse_sigmoid, build_rotation
 from src.scene.deformation import ExplicitDeformation, ExplicitSparseDeformation, MeshSparseDeformation
@@ -143,7 +143,7 @@ class GaussianModel(nn.Module):
         # Have to apply the same world coordinate convention change and scaling to go to Nerfstudio convention as the
         #  cameras, see dataloader
         transform = SWAP_AND_FLIP_WORLD_AXES.to(triangle_centers.device)
-        triangle_centers = (transform[:3, :3] @ triangle_centers.T).T * SCALE
+        triangle_centers = (transform[:3, :3] @ triangle_centers.T).T * self.cfg['scale']
         points = triangle_centers
         rgb_norm = torch.ones_like(points)
         fused_point_cloud = points
@@ -542,7 +542,7 @@ class MeshAwareGaussianModel(GaussianModel):
     def get_mesh_vertices(self):
         return self.current_mesh_vertices
         
-    def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0, gaussians_per_triangle=25):
+    def create_from_mesh(self, mesh, registration, depth, scale, spatial_lr_scale=1.0, gaussians_per_triangle=25):
         self.spatial_lr_scale = spatial_lr_scale
         register_mesh(mesh, registration)
         
@@ -550,7 +550,7 @@ class MeshAwareGaussianModel(GaussianModel):
         vertices = torch.tensor(mesh.points, dtype=torch.float32)
         # Reorient and scale
         transform = SWAP_AND_FLIP_WORLD_AXES
-        vertices = (transform[:3, :3] @ vertices.T).T * SCALE
+        vertices = (transform[:3, :3] @ vertices.T).T * scale
         vertices = vertices.cuda()
 
         # Get faces (see explanation here https://stackoverflow.com/questions/51201888/retrieving-facets-and-point-from-vtk-file-in-python)
@@ -857,7 +857,7 @@ class MeshAwareGaussianModel(GaussianModel):
         rots = self.rotation_activation(self.compute_rotations_from_normals(normals))
 
         scales = self.scaling_activation(self._scaling)
-        capped_scales = torch.minimum(scales, self.scaling_activation(self.original_scales) * 10)
+        capped_scales = torch.minimum(scales, self.scaling_activation(self.original_scales) * 2)
 
         opacity = self.opacity_activation(self._opacity)
         # Fixing the z direction (normal of parent face) scale to be small -> "flat" Gaussian

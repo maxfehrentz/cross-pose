@@ -10,7 +10,7 @@ cam:
 
 data:
   image_input_folder: /home/fsc/max/Data/Pigs/pig7/dynamic_breathing_half_res
-  transforms: /home/fsc/max/Data/Pigs/pig7/dynamic_breathing_half_res/transforms.json
+  transforms: /home/fsc/max/Data/Pigs/pig7/dynamic_breathing_half_res/reduced_transforms.json
   mesh: /home/fsc/max/Data/Pigs/pig7/ImFusionExport_abdominal_cavity_coarse.obj
   output: output/ATLAS/pig7/dynamic_breathing
 

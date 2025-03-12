@@ -61,3 +61,5 @@ model:
   deform_network: # Deform network
     model: sparse
     subsample: 64
+
+eval: False

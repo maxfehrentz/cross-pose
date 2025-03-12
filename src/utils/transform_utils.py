@@ -1,9 +1,6 @@
 import torch
 
 
-# Apparently necessary to be in correct metric; guessing mm to cm
-SCALE = 10
-
 # Reorient camera in camera space; flip y and z axes (OpenGL/Blender/Nerfstudio to COLMAP/OpenCV convention)
 FLIP_CAM_AXES = torch.tensor([[1, 0, 0, 0],
                               [0, -1, 0, 0],
@@ -20,16 +17,13 @@ SWAP_AND_FLIP_WORLD_AXES = torch.tensor([[0, 1, 0, 0],
                                          [0, 0, -1, 0],
                                          [0, 0, 0, 1]], dtype=torch.float32)
 
-def reverse_cam_convention_changes(c2w):
+def reverse_cam_convention_changes(c2w, scale):
     # Swap and flip axes back from opencv to opengl convention; see datasets.py for explanation
     swap_and_flip_world_axes = SWAP_AND_FLIP_WORLD_AXES.to(c2w.device)
     c2w = swap_and_flip_world_axes @ c2w
-
     # Flip y and z axis again to go back to nerfstudio convention
     flip_cam_axes = FLIP_CAM_AXES.to(c2w.device)
     c2w = c2w @ flip_cam_axes
-
     # Divide the translation by scale again
-    c2w[:3, 3] = c2w[:3, 3] / SCALE
-
+    c2w[:3, 3] = c2w[:3, 3] / scale
     return c2w
