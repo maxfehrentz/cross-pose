@@ -1,6 +1,7 @@
 import numpy as np
 import os
 import torch
+import torchvision
 import wandb
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 from scipy.spatial import KDTree
@@ -12,8 +13,8 @@ from src.utils.CT_reader import read_ct_volume
 from src.utils.camera import Camera
 from src.utils.FrameVisualizer import FrameVisualizer
 from src.utils.flow_utils import get_depth_from_raft
-from src.utils.datasets import MonoMeshMIS
-from src.utils.loss_utils import l1_loss
+from src.utils.datasets import MonoMeshMIS, NeuroWrapper
+from src.utils.loss_utils import l1_loss, VGGPerceptualLoss, GaussianAppearanceRegularizer
 from src.utils.renderer import render
 from src.scene.gaussian_model import MeshAwareGaussianModel
 from src.utils.mesh_utils import preprocess_mesh, undo_preprocess_mesh, undo_register_mesh
@@ -37,6 +38,8 @@ from torch.utils.tensorboard import SummaryWriter
 # For VTK
 import vtk
 
+# For pose estimation
+from src.scene.camera_pose import CameraPose
 
 class SceneOptimizer():
     def __init__(self, cfg, args):
@@ -49,8 +52,13 @@ class SceneOptimizer():
         self.device = cfg['device']
         self.output = cfg['data']['output']
 
-        self.frame_reader = MonoMeshMIS(cfg, args, scale=self.scale)
-        # self.frame_reader = StereoMIS(cfg, args, scale=self.scale)
+        if self.cfg['dataset'] == 'ATLAS' or self.cfg['dataset'] == 'SOFA':
+            self.frame_reader = MonoMeshMIS(cfg, args, scale=self.scale)
+        elif self.cfg['dataset'] == 'NEURO':
+            self.frame_reader = NeuroWrapper(cfg, args, scale=self.scale)
+        else:
+            raise ValueError(f"Dataset {self.cfg['dataset']} not supported")
+        
         self.n_img = len(self.frame_reader)
         self.frame_loader = DataLoader(self.frame_reader, batch_size=1, num_workers=0 if args.debug else 4)
         # self.net = GaussianModel(cfg=cfg['model'])
@@ -105,6 +113,129 @@ class SceneOptimizer():
             # Contains volumetric and metadata, check method for details
             self.ct_volume = read_ct_volume(CT_folder)
 
+    
+    def estimate_pose(self, target, max_iter=500, camera_idx=0, lr_pose=0.1, lr_model=1):
+        '''
+        Estimate the pose of the target image, initialzed from camera_idx
+        '''
+        # Load a target image, target is the path to that image
+        target_img_original = cv2.imread(target)
+
+        target_img = cv2.cvtColor(target_img_original, cv2.COLOR_BGR2RGB)
+        target_img = torch.from_numpy(target_img).cuda() / 255.0  # Normalize to [0,1]
+
+        # Use the frameloader to get camera pose
+        # TODO: dangerous for this not to be a dict, fix later
+        self.camera.set_c2w(self.frame_reader[camera_idx][3].to(self.device))
+
+        # Invert the current camera pose
+        current_w2c = torch.inverse(self.camera.c2w)
+        init_pose = CameraPose(current_w2c.cuda(), self.camera.FoVx, self.camera.FoVy, self.camera.image_width, self.camera.image_height)
+        init_pose = init_pose.cuda()
+
+        # Add pose and self.net parameters to the optimizer
+        optimizer = torch.optim.Adam([
+            {'params': init_pose.parameters(), 'lr': lr_pose},
+            {'params': self.net.parameters(), 'lr': lr_model}
+        ])
+
+        # Disable all gradients for the model
+        self.net.train()
+        for param in self.net.parameters():
+            param.requires_grad = False
+
+        for i in tqdm(range(max_iter), desc="Pose estimation"):
+            optimizer.zero_grad()
+
+            # TODO: this should kick in at the very end of optimization
+            # if i == max_iter - 10:
+            if i == 0:
+                # Activate gradients for the appearance related ones
+                for name, param in self.net.named_parameters():
+                    if '_features_dc' in name or '_features_rest' in name:
+                        print(f"Enabling gradient for {name}")
+                        param.requires_grad = True
+
+            # Render image
+            render_pkg = render(init_pose, self.net, self.background, self.scale, deform=False)
+            rendered_img = render_pkg['render']
+
+            if i == 0:
+                # Check if the target image is in the same format as the rendered image, if not resize
+                # TODO: this step would mess up intrinsics if we were to estimate them
+                if target_img.shape != rendered_img.shape:
+                    print(f"Target image shape: {target_img.shape}")
+                    print(f"Rendered image shape: {rendered_img.shape}")
+                    print("Resizing target image to match rendered image shape")
+                    target_img_original = cv2.resize(target_img_original, (rendered_img.shape[0], rendered_img.shape[1]))
+                    target_img = cv2.cvtColor(target_img_original, cv2.COLOR_BGR2RGB)
+                    target_img = torch.from_numpy(target_img).cuda() / 255.0  # Normalize to [0,1]
+                    print(f"shape of target image after resize: {target_img.shape}")
+
+            # TODO: compute the style loss here
+            perceptual_loss = VGGPerceptualLoss()
+            # For perceptual loss, have to swap the color channels to be in the right position
+            style_loss = perceptual_loss(rendered_img.permute(2, 0, 1).unsqueeze(0), target_img.permute(2, 0, 1).unsqueeze(0), feature_layers=[0, 1, 2, 3], style_layers=[0, 1, 2, 3])
+
+            style_loss.backward(retain_graph=True)
+             # Make sure those grads do not affect the camera pose
+            for param in init_pose.parameters():
+                param.grad = None
+            # Store network gradients
+            model_grads = {}
+            for name, param in self.net.named_parameters():
+                if param.grad is not None:
+                    model_grads[name] = param.grad.clone()
+                    param.grad = None
+
+            # Save original images before blurring
+            original_rendered_img = rendered_img.clone()
+            original_target_img = target_img.clone()
+
+            # Reshape from (H, W, C) to (C, H, W) for the blurring
+            rendered_img = rendered_img.permute(2, 0, 1)
+            target_img = target_img.permute(2, 0, 1)
+            rendered_img = torchvision.transforms.GaussianBlur(kernel_size=15, sigma=10)(rendered_img)
+            target_img = torchvision.transforms.GaussianBlur(kernel_size=15, sigma=10)(target_img)
+            # Reshape back to (H, W, C)
+            rendered_img = rendered_img.permute(1, 2, 0)
+            target_img = target_img.permute(1, 2, 0)
+
+            # Compute l1 loss
+            loss = l1_loss(rendered_img, target_img)
+            print(f"Pixel loss: {loss.item()}")
+            
+            loss.backward()
+
+            # Overwrite the model grads
+            for name, param in self.net.named_parameters():
+                if name in model_grads:
+                    param.grad = model_grads[name]
+
+            optimizer.step()
+
+            # Update pose parameters
+            init_pose(current_w2c)
+
+            # TODO: all the visualization below should get its own visualization method
+
+            # Save the rendered image, blend the target image in the background
+            rendered_img_vis = np.clip(original_rendered_img.detach().cpu().numpy(), 0, 1)
+            rendered_img_vis = (255*rendered_img_vis).clip(0, 255).astype(np.uint8)
+            rendered_img_vis = cv2.cvtColor(rendered_img_vis, cv2.COLOR_RGB2BGR)
+            # Blend the target image in the background
+            blended_img = (0.5*rendered_img_vis + 0.25*target_img_original).astype(np.uint8)
+            cv2.imwrite(f"{self.output}/pose_estimation_blended_{i}.png", blended_img)
+
+            # Save the blurred rendered image as well
+            rendered_img_blur = np.clip(rendered_img.detach().cpu().numpy(), 0, 1)
+            rendered_img_blur = (255*rendered_img_blur).clip(0, 255).astype(np.uint8)
+            rendered_img_blur = cv2.cvtColor(rendered_img_blur, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(f"{self.output}/pose_estimation_blurred_{i}.png", rendered_img_blur)
+
+            # Save the original rendered image as well
+            cv2.imwrite(f"{self.output}/pose_estimation_original_{i}.png", rendered_img_vis)
+
 
     def fit(self, frame, iters, incremental):
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA, ProfilerActivity.XPU]) as prof:
@@ -122,7 +253,9 @@ class SceneOptimizer():
                 render_pkg = render(self.camera, self.net, self.background, self.scale, deform=incremental)
             self.net.eval()
             color = render_pkg['render'][None, ...]
-            depth = render_pkg['depth'][None, ...]
+            # Currently used renderer does not support depth
+            # depth = render_pkg['depth'][None, ...]
+            depth = torch.ones_like(color)
 
             # Convert rendered depth map to a relative depth map
             depth = depth / depth.max()
@@ -228,6 +361,13 @@ class SceneOptimizer():
             global_max_error = 0
 
         for ids, gt_color, gt_color_r, gt_c2w, registration, tool_mask, semantics, intrinsics, gt_mesh_path in tqdm(self.frame_loader, total=self.n_img):
+            # TODO: remove later, hack for now
+            if ids.item() == 10:
+                # Save the net
+                print("Saving the model...")
+                torch.save(self.net.state_dict(), f'{self.output}/net.pth')
+                return
+            
             gt_color = gt_color.cuda()
             gt_color_r = gt_color_r.cuda() if gt_color_r is not None else None
             gt_c2w = gt_c2w.cuda()
@@ -270,9 +410,21 @@ class SceneOptimizer():
                 # Render once to check for visibility filter and initialize the deformation field based on that
                 with torch.no_grad():
                     self.camera.set_c2w(gt_c2w)
+
                     render_pkg = render(self.camera, self.net, self.background, self.scale, deform=False)
                     visibility_filter = render_pkg['visibility_filter']
                     self.net.setup_deformation_field(visibility_filter, self.mesh.copy())
+
+                    # TODO: this should happen somewhere else, method is a mess
+                    if os.path.exists(f'{self.output}/net.pth'):
+                        print("Loading the model...")
+                        state_dict = torch.load(f'{self.output}/net.pth')
+                        print("Saved state dict keys:", state_dict.keys())
+                        print("Current model state dict keys:", self.net.state_dict().keys())
+                        self.net.load_state_dict(state_dict)
+                        return
+                    else:
+                        print("No model found, starting from scratch")
 
                 # Save the original mesh without any preprocessing
                 slicer_mesh = self.mesh.copy()
@@ -283,9 +435,9 @@ class SceneOptimizer():
                 # Setup for training
                 self.net.training_setup(self.cfg['training'])
                 # Fit first frame
-                self.fit(frame, iters=self.cfg['training']['iters_first'], incremental=True)
+                self.fit(frame, iters=self.cfg['training']['iters_first'], incremental=False)
             else:
-                self.fit(frame, iters=self.cfg['training']['iters'], incremental=True)
+                self.fit(frame, iters=self.cfg['training']['iters'], incremental=False)
 
             # eval
             with torch.no_grad():
@@ -315,8 +467,8 @@ class SceneOptimizer():
                     _, _ = self.visualizer.save_imgs(ids.item(), gt_depth, gt_color,
                                                                         gt_c2w, self.scale, mesh=mesh_copy,
                                                                         registration=registration, deformed_mesh=deformed_mesh)
-                    # Visualization of the deformations in particular
-                    self.visualizer.save_mesh_deformations(ids.item(), gt_c2w, mesh_copy, deformed_mesh, registration, control_vertices, control_def, self.scale)
+                    # # Visualization of the deformations in particular
+                    # self.visualizer.save_mesh_deformations(ids.item(), gt_c2w, mesh_copy, deformed_mesh, registration, control_vertices, control_def, self.scale)
 
                     if self.ct_volume is not None:
                         if ids.item() == 0: 
@@ -423,4 +575,12 @@ if __name__ == "__main__":
     cfg['data']['output'] = args.output if args.output else cfg['data']['output']
 
     trainer = SceneOptimizer(cfg, args)
+
+    print("Start training...")
     trainer.run()
+    print("Training finished")
+
+    # Estimate pose for the first frame
+    print("Start pose estimation...")
+    trainer.estimate_pose(cfg['data']['target_image'], max_iter=500, camera_idx=67)
+    print("Pose estimation finished")

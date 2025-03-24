@@ -1,0 +1,8 @@
+inherit_from: configs/Neuro/neuro_base.yaml
+
+data:
+  image_input_folder: /home/fsc/max/Data/MedIA/miccai24/207/data/datasets/mr/images
+  mesh: /home/fsc/max/Data/MedIA/miccai24/207/data/mesh.obj
+  transforms: /home/fsc/max/Data/MedIA/miccai24/207/data/datasets/mr/transforms.json
+  output: output/Neuro/207
+  target_image: /home/fsc/max/Data/MedIA/miccai24/207/data/target.png

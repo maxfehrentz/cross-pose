@@ -48,9 +48,11 @@ class FrameVisualizer(object):
 
         """
         self.camera.set_c2w(c2w)
-        render_pkg = render(self.camera, self.net, self.background, scale, mesh=mesh, registration=registration, deform=True, deformed_mesh=deformed_mesh)
+        render_pkg = render(self.camera, self.net, self.background, scale, mesh=mesh, registration=registration, deform=False, deformed_mesh=deformed_mesh)
 
-        splat_depth = render_pkg['depth']
+        # renderer for pose estimation does not support depth
+        # splat_depth = render_pkg['depth']
+        splat_depth = torch.ones_like(gt_depth)
         mesh_depth = render_pkg['mesh_depth']
         deformed_mesh_depth = render_pkg['deformed_depth']
 

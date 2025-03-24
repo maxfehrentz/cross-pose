@@ -111,6 +111,77 @@ class MonoMeshMIS(Dataset):
         return len(self.poses)
 
 
+# TODO: a bit misleading, also for MonoMeshMIS, that we are loading the mesh separately somewhere else
+class Neuro(Dataset):
+    def __init__(self, cfg, args, scale):
+        super(Neuro, self).__init__()
+        self.name = cfg['dataset']
+
+        self.scale = scale
+        self.input_folder = cfg['data']['image_input_folder']
+        self.transforms_path = cfg['data']['transforms']
+
+        # Load cameras and image and mask paths
+        self.poses, self.intrinsics, self.image_paths, self.registration_matrix = self.load_cams_and_filepaths(self.transforms_path)
+        return
+
+
+    def load_cams_and_filepaths(self, path: str):
+        with open(path, 'r') as f:
+            data = json.load(f)
+
+        frames = data['frames']
+
+        # Since filenames are in weird format and we are specifying the input folder elsewhere, strip everything but filename
+        image_paths = [os.path.join(self.input_folder, frame['file_path'].split('/')[-1]) for frame in frames]
+        poses = np.array([frame['transform_matrix'] for frame in frames], dtype=float)
+        poses = torch.from_numpy(poses).float()
+        # TODO: Might have to add this later, since it is not moving, should just be a single entry to the json at the top level
+        # Make identity matrix for now
+        registration_matrix = np.eye(4)
+        registration_matrix = torch.from_numpy(registration_matrix).float()
+
+        # Load intrinsics and wrap them in a dict
+        fx = data['fl_x']
+        fy = data['fl_y']
+        cx = data['cx']
+        cy = data['cy']
+        intrinsics = np.array([[fx, fy, cx, cy]])
+        intrinsics = torch.from_numpy(intrinsics).float()
+
+        # Scale the translations; apparently necessary to be in correct metric
+        poses[:, :3, 3] *= self.scale
+        # Reorient camera in camera space
+        poses = poses @ FLIP_CAM_AXES
+        # Reorient world space
+        poses = SWAP_AND_FLIP_WORLD_AXES @ poses
+
+        return poses, intrinsics, image_paths, registration_matrix
+
+
+    def __getitem__(self, index):
+        image_data = cv2.cvtColor(cv2.imread(self.image_paths[index]), cv2.COLOR_BGR2RGB)
+        image_data = torch.from_numpy(image_data)
+        image_data = image_data / 255.
+
+        pose = self.poses[index]
+        registration_matrix = self.registration_matrix
+        intrinsics = self.intrinsics
+        return index, image_data, pose, registration_matrix, intrinsics
+    
+    def __len__(self):
+        return len(self.poses)
+
+
+class NeuroWrapper(Neuro):
+    def __init__(self, cfg, args, scale):
+        super(NeuroWrapper, self).__init__(cfg, args, scale)
+
+    def __getitem__(self, index):
+        _, image_data, pose, registration_matrix, intrinsics = super().__getitem__(index)
+        return index, image_data, None, pose, registration_matrix, None, None, intrinsics, None
+
+
 class StereoMIS(Dataset):
     def __init__(self, cfg, args, scale):
         super(StereoMIS, self).__init__()

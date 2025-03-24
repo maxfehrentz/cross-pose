@@ -11,7 +11,7 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from icomma_diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from src.scene.gaussian_model import GaussianModel, MeshAwareGaussianModel
 from src.utils.sh_utils import RGB2SH
 from src.utils.mesh_utils import register_mesh
@@ -178,12 +178,14 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scale,
         tanfovy=tanfovy,
         bg=bg_color,
         scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform.cuda(),
-        projmatrix=viewpoint_camera.full_proj_transform.cuda(), # seems like a 4x4 matrix
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform, # seems like a 4x4 matrix
         sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center.cuda(),
+        campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=False
+        debug=False,
+        compute_grad_cov2d=True,
+        proj_k=viewpoint_camera.projection_matrix
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -191,7 +193,7 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scale,
     means2D = screenspace_points
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, depth, alpha, rendered_semantics = rasterizer(
+    rendered_image, radii = rasterizer(
         means3D = xyz,
         means2D = means2D,
         shs = shs,
@@ -200,11 +202,14 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scale,
         scales = scales,
         rotations = rots,
         cov3D_precomp = None,
-        semantics = semantics)
+        camera_center = viewpoint_camera.camera_center,
+        camera_pose = viewpoint_camera.world_view_transform)
     rendered_image = rendered_image.permute(1, 2, 0)
-    depth = depth.squeeze(0)
+
+    # depth = depth.squeeze(0)
     # spotlight light source model
-    rendered_image = viewpoint_camera.spotlight_render(rendered_image, depth.detach())
+    # TODO: adding again later, simplifying for now
+    # rendered_image = viewpoint_camera.spotlight_render(rendered_image, depth.detach())
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
 
@@ -222,9 +227,6 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scale,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
-                "depth": depth,
-                "alpha": alpha.squeeze(0),
-                "semantics": rendered_semantics,
                 "mesh_surface": mesh_surface,
                 "mesh_depth": mesh_depth,
                 "deformed_surface": deformed_surface,
@@ -236,8 +238,5 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scale,
         return {"render": rendered_image,
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
-                "radii": radii,
-                "depth":depth,
-                "alpha": alpha.squeeze(0),
-                "semantics": rendered_semantics}
+                "radii": radii}
 
