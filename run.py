@@ -16,7 +16,7 @@ from src.utils.flow_utils import get_depth_from_raft
 from src.utils.datasets import MonoMeshMIS, NeuroWrapper
 from src.utils.loss_utils import l1_loss, VGGPerceptualLoss, GaussianAppearanceRegularizer
 from src.utils.renderer import render
-from src.scene.gaussian_model import MeshAwareGaussianModel
+from src.scene.gaussian_model import MeshAwareGaussianModel, HyperMeshAwareGaussianModel
 from src.utils.mesh_utils import preprocess_mesh, undo_preprocess_mesh, undo_register_mesh
 from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES
 
@@ -62,7 +62,8 @@ class SceneOptimizer():
         self.n_img = len(self.frame_reader)
         self.frame_loader = DataLoader(self.frame_reader, batch_size=1, num_workers=0 if args.debug else 4)
         # self.net = GaussianModel(cfg=cfg['model'])
-        self.net = MeshAwareGaussianModel(cfg=cfg['model'])
+        # self.net = MeshAwareGaussianModel(cfg=cfg['model'])
+        self.net = HyperMeshAwareGaussianModel(cfg=cfg['model'], hypernet_cfg=None)
         self.camera = Camera(cfg['cam'])
         if self.cfg['model']['ARAP']['active']:
             self.output = f"{self.output}_ARAP"
@@ -266,7 +267,7 @@ class SceneOptimizer():
 
             loss = Ll1
 
-            if isinstance(self.net, MeshAwareGaussianModel):
+            if isinstance(self.net, MeshAwareGaussianModel) or isinstance(self.net, HyperMeshAwareGaussianModel):
                 with record_function("compute regularization terms"):
                     reg_arap, reg_scale, reg_rigid_loc, reg_rigid_rot, reg_iso, reg_visibility = self.net.compute_regularization(render_pkg["visibility_filter"])
                     l_arap = reg_arap * self.cfg['training']['w_def']['w_arap']
@@ -287,13 +288,6 @@ class SceneOptimizer():
             viewspace_point_tensor_grad += render_pkg["viewspace_points"].grad
 
             with torch.no_grad():
-                # Saving
-                self.net.add_densification_stats(viewspace_point_tensor_grad, render_pkg["visibility_filter"])
-
-                # Densification
-                if iter > self.cfg["training"]["densify_from_iter"] and iter % self.cfg["training"]["densification_interval"] == 0:
-                    self.net.densify(self.cfg["training"]["densify_grad_threshold"])
-
                 #Optimizer step
                 if iter < iters:
                     self.net.optimizer.step()
@@ -363,9 +357,9 @@ class SceneOptimizer():
         for ids, gt_color, gt_color_r, gt_c2w, registration, tool_mask, semantics, intrinsics, gt_mesh_path in tqdm(self.frame_loader, total=self.n_img):
             # TODO: remove later, hack for now
             if ids.item() == 10:
-                # Save the net
-                print("Saving the model...")
-                torch.save(self.net.state_dict(), f'{self.output}/net.pth')
+                # # Save the net
+                # print("Saving the model...")
+                # torch.save(self.net.state_dict(), f'{self.output}/net.pth')
                 return
             
             gt_color = gt_color.cuda()
@@ -429,7 +423,6 @@ class SceneOptimizer():
                 # Save the original mesh without any preprocessing
                 slicer_mesh = self.mesh.copy()
                 undo_preprocess_mesh(slicer_mesh, self.cfg['dataset'])
-                np.savetxt(f'{self.output}/original_mesh_vertices.txt', slicer_mesh.points[self.net.mesh_deformation.control_ids.cpu().numpy(), :])
                 pv.save_meshio(f'{self.output}/original_mesh.obj', slicer_mesh)
 
                 # Setup for training
@@ -460,7 +453,6 @@ class SceneOptimizer():
                         # We have to go back to the original mesh/CT space; the registration was applied in the Gaussian model, have to go back
                         undo_register_mesh(slicer_deformed_mesh, registration)
                         undo_preprocess_mesh(slicer_deformed_mesh, self.cfg['dataset'])
-                        np.savetxt(f'{self.output}/deformed_vertices_{ids.item()}.txt', slicer_deformed_mesh.points[control_vertices_indices.cpu().numpy(), :])
                         pv.save_meshio(f'{self.output}/deformed_mesh_{ids.item()}.obj', slicer_deformed_mesh)
 
                     # General visualization of the current iteration

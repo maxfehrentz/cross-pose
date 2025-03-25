@@ -12,7 +12,7 @@
 import torch
 import math
 from icomma_diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from src.scene.gaussian_model import GaussianModel, MeshAwareGaussianModel
+from src.scene.gaussian_model import GaussianModel, MeshAwareGaussianModel, HyperMeshAwareGaussianModel
 from src.utils.sh_utils import RGB2SH
 from src.utils.mesh_utils import register_mesh
 from src.utils.transform_utils import reverse_cam_convention_changes, SWAP_AND_FLIP_WORLD_AXES
@@ -158,7 +158,7 @@ def render(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scale,
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    if isinstance(pc, MeshAwareGaussianModel):
+    if isinstance(pc, MeshAwareGaussianModel) or isinstance(pc, HyperMeshAwareGaussianModel):
         screenspace_points = torch.zeros(size=(pc._parent_faces.shape[0], 3), dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     else:
         screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0

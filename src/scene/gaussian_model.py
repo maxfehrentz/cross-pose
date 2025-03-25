@@ -14,6 +14,8 @@ import os
 from torch.autograd import Function
 import arap_cpp
 # import arap_cuda
+# For hypernet
+import hyperlight as hl
 
 
 class GaussianModel(nn.Module):
@@ -848,10 +850,7 @@ class MeshAwareGaussianModel(GaussianModel):
 
         self.densification_postfix(new_barycentric, new_features_dc, new_features_rest, new_opacities, new_scaling, new_parent_faces)
         
-    def forward(self, deform=True):
-        # TODO: for improved coupling between Gaussians and mesh, might change again later though
-        self._opacity.requires_grad = False
-
+    def forward(self, deform=False):
         # Compute Gaussian positions from mesh and parameters
         xyz, normals = self.compute_positions_and_normals(deform)
         rots = self.rotation_activation(self.compute_rotations_from_normals(normals))
@@ -1072,3 +1071,90 @@ class MeshAwareGaussianModel(GaussianModel):
         return padded_neighbors, neighbor_mask
 
 
+class HyperMeshAwareGaussianModel(nn.Module):
+    def __init__(self, cfg, hypernet_cfg):
+        super().__init__()
+        self.hypernet_cfg = hypernet_cfg
+        self.model = MeshAwareGaussianModel(cfg)
+
+    def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0):
+        self.model.create_from_mesh(mesh, registration, depth, spatial_lr_scale)
+        self.model = hl.hypernetize(self.model, parameters=[self.model._features_dc, self.model._features_rest])
+        params_shape = self.model.external_shapes()
+        # TODO: will later have to make sure this is identical to architecture from previous paper
+        self.hypernet = hl.HyperNet(
+            input_shapes={'h': (256,)},
+            output_shapes=params_shape,
+            hidden_sizes=[16, 64, 128],).to("cuda")
+
+    def forward(self, deform=False):
+        # Get new params from hypernet
+        # TODO: using dummy data for now, change later
+        vector = torch.ones((256,)).to("cuda")
+        new_params = self.hypernet(h=vector)
+        with self.model.using_externals(new_params):
+            return self.model.forward(deform)
+
+    def compute_regularization(self, visibility_filter):
+        return self.model.compute_regularization(visibility_filter)
+    
+    @property
+    def get_xyz(self):
+        return self.model.get_xyz
+    
+    @property
+    def get_scaling(self):
+        return self.model.get_scaling
+
+    @property
+    def active_sh_degree(self):
+        return self.model.active_sh_degree
+    
+    @property
+    def _parent_faces(self):
+        return self.model._parent_faces
+    
+    def setup_deformation_field(self, visibility_filter, mesh):
+        self.model.setup_deformation_field(visibility_filter, mesh)
+
+    def training_setup(self, training_args):
+        # Overwriting the usual training setup to accommodate for hypernet optimization as well
+        # TODO: figure out whether that is needed, and if it is, remove all that hypernet stuff
+        self.model.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.model.gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.model.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        l = [
+            {'params': [self.model._barycentric_coords], 'lr': training_args["barycentric_coords_lr"], "name": "barycentric_coords"},
+            # TODO: lr is usually multiplied by self.spatial_lr_scale, don't care about deformations now though
+            # {'params': self.model.mesh_deformation.parameters(), 'lr': training_args["deformation_lr_init"], "name": "deformation"},
+            {'params': [self.model._opacity], 'lr': training_args["opacity_lr"], "name": "opacity"},
+            {'params': [self.model._scaling], 'lr': training_args["scaling_lr"], "name": "scaling"},
+            # TODO: deal with this later, will need a proper config for the hypernet to determine lr and also architecture
+            {'params': self.hypernet.parameters(), 'lr': 0.001, "name": "hypernet"},
+        ]
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+
+    def enable_spherical_harmonics(self):
+        self.model.enable_spherical_harmonics()
+
+    @property
+    def get_mesh_vertices(self):
+        return self.model.get_mesh_vertices
+
+    @property
+    def mesh_deformation(self):
+        return self.model.mesh_deformation
+
+    @property
+    def original_mesh_vertices(self):
+        return self.model.original_mesh_vertices
+
+    def reset_optimizer(self):
+        for group in self.optimizer.param_groups:
+            for idx in range(len(group['params'])):
+                stored_state = self.optimizer.state.get(group['params'][idx], None)
+                if stored_state is not None:
+                    stored_state["exp_avg"][:] = 0.0
+                    stored_state["exp_avg_sq"][:] = 0.0
+                    stored_state["state_step"] = 0
+                    self.optimizer.state[group['params'][idx]] = stored_state
