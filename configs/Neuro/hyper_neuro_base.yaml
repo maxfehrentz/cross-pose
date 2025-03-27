@@ -1,0 +1,21 @@
+inherit_from: configs/Neuro/neuro_base.yaml
+dataset: 'HYPERNEURO'
+
+cam:
+  H: 512
+  W: 512
+  fx: 955.4050067376327
+  fy: 955.4050067376327
+  cx: 256
+  cy: 256
+
+training:
+  hypernet_training: True
+  hypernet:
+    iters_per_style: 5
+    lr: 1e-2
+    eps: 1e-15
+    max_iterations: 50000
+    exp_decay_scheduler_final: 0.0001
+
+

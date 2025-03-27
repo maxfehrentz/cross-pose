@@ -1,0 +1,9 @@
+inherit_from: configs/Neuro/hyper_neuro_base.yaml
+
+data:
+  base_folder: /home/fsc/max/Data/MedIA/miccai24/003/data/datasets
+  image_input_folder: images
+  transforms: transforms.json
+  style_folder: /home/fsc/max/Data/MedIA/miccai24/003/data/textures
+  mesh: /home/fsc/max/Data/MedIA/miccai24/003/data/mesh.obj
+  output: output/Neuro/hyper_003

@@ -13,7 +13,7 @@ from src.utils.CT_reader import read_ct_volume
 from src.utils.camera import Camera
 from src.utils.FrameVisualizer import FrameVisualizer
 from src.utils.flow_utils import get_depth_from_raft
-from src.utils.datasets import MonoMeshMIS, NeuroWrapper
+from src.utils.datasets import MonoMeshMIS, Neuro, HyperNeuro
 from src.utils.loss_utils import l1_loss, VGGPerceptualLoss, GaussianAppearanceRegularizer
 from src.utils.renderer import render
 from src.scene.gaussian_model import MeshAwareGaussianModel, HyperMeshAwareGaussianModel
@@ -47,6 +47,8 @@ class SceneOptimizer():
         self.cfg = cfg
         self.args = args
         self.visualize = args.visualize
+        self.hypernet_training = self.cfg['training']['hypernet_training']
+        self.deform = self.cfg['model']['deform']
         self.eval = cfg['eval']
         self.scale = cfg['scale']
         self.device = cfg['device']
@@ -55,15 +57,26 @@ class SceneOptimizer():
         if self.cfg['dataset'] == 'ATLAS' or self.cfg['dataset'] == 'SOFA':
             self.frame_reader = MonoMeshMIS(cfg, args, scale=self.scale)
         elif self.cfg['dataset'] == 'NEURO':
-            self.frame_reader = NeuroWrapper(cfg, args, scale=self.scale)
+            self.frame_reader = Neuro(cfg, args, scale=self.scale)
+        elif self.cfg['dataset'] == 'HYPERNEURO':
+            self.frame_reader = HyperNeuro(cfg, args, scale=self.scale)
         else:
             raise ValueError(f"Dataset {self.cfg['dataset']} not supported")
         
-        self.n_img = len(self.frame_reader)
-        self.frame_loader = DataLoader(self.frame_reader, batch_size=1, num_workers=0 if args.debug else 4)
-        # self.net = GaussianModel(cfg=cfg['model'])
-        # self.net = MeshAwareGaussianModel(cfg=cfg['model'])
-        self.net = HyperMeshAwareGaussianModel(cfg=cfg['model'], hypernet_cfg=None)
+        shuffle = False
+        if self.hypernet_training:
+            self.n_img = self.cfg['training']['hypernet']['max_iterations']
+            self.iters_per_style = self.cfg['training']['hypernet']['iters_per_style']
+            self.net = HyperMeshAwareGaussianModel(cfg=cfg['model'], hypernet_cfg=None)
+            shuffle = True
+        else:
+            self.n_img = len(self.frame_reader)
+            self.net = MeshAwareGaussianModel(cfg=cfg['model'])
+
+        # TODO: set num_workers to 0 to prevent prefetching data and force actual switching between datasets
+        #  find better way to do this
+        self.frame_loader = DataLoader(self.frame_reader, batch_size=1, num_workers=0, shuffle=shuffle)
+
         self.camera = Camera(cfg['cam'])
         if self.cfg['model']['ARAP']['active']:
             self.output = f"{self.output}_ARAP"
@@ -238,7 +251,10 @@ class SceneOptimizer():
             cv2.imwrite(f"{self.output}/pose_estimation_original_{i}.png", rendered_img_vis)
 
 
-    def fit(self, frame, iters, incremental):
+    # TODO: don't like how we pass deform here despite it being an attribute anyways; also weird to call it in render, would be better
+    #  to have it as a parameter of the model (here called net) and put the logic in there
+    # TODO: when using an attribute to control whether deformation happens, we should also not require ARAP config, the def. network etc.
+    def fit(self, frame, iters, deform):
         # with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA, ProfilerActivity.XPU]) as prof:
         self.net.reset_optimizer()
         idx, gt_color, gt_depth, gt_c2w, tool_mask = frame
@@ -251,7 +267,7 @@ class SceneOptimizer():
             self.net.train(iter == 1)
 
             with record_function("render"):
-                render_pkg = render(self.camera, self.net, self.background, self.scale, deform=incremental)
+                render_pkg = render(self.camera, self.net, self.background, self.scale, deform=deform)
             self.net.eval()
             color = render_pkg['render'][None, ...]
             # Currently used renderer does not support depth
@@ -354,12 +370,31 @@ class SceneOptimizer():
             mesh_error_std = []
             global_max_error = 0
 
-        for ids, gt_color, gt_color_r, gt_c2w, registration, tool_mask, semantics, intrinsics, gt_mesh_path in tqdm(self.frame_loader, total=self.n_img):
+        iters = 0
+
+        for frame_data in tqdm(self.frame_loader, total=self.n_img):
+            iters += 1              
+
+            ids = frame_data.ids
+            gt_color = frame_data.gt_color
+            gt_color_r = frame_data.gt_color_r
+            gt_c2w = frame_data.gt_c2w
+            registration = frame_data.registration
+            tool_mask = frame_data.tool_mask
+            semantics = frame_data.semantics
+            intrinsics = frame_data.intrinsics
+            gt_mesh_path = frame_data.gt_mesh_path
+            style_img_path = frame_data.style_img_path
+
+            if self.hypernet_training and style_img_path is not None:
+                # Has become a list through collate function in DataLoader
+                self.net.set_style_img_path(style_img_path[0])
+
             # TODO: remove later, hack for now
-            if ids.item() == 10:
-                # # Save the net
-                # print("Saving the model...")
-                # torch.save(self.net.state_dict(), f'{self.output}/net.pth')
+            if iters == 99:
+                # Save the net
+                print("Saving the model...")
+                torch.save(self.net.state_dict(), f'{self.output}/net.pth')
                 return
             
             gt_color = gt_color.cuda()
@@ -395,7 +430,7 @@ class SceneOptimizer():
                 intrinsics = torch.squeeze(intrinsics)
                 self.camera.set_intrinsics(fx=intrinsics[0], fy=intrinsics[1], cx=intrinsics[2], cy=intrinsics[3])
 
-            if ids.item() == 0:
+            if iters == 1:
                 # Note that we are using the matrix coming from the first frame; some datasets provide a registration
                 #  matrix for each frame, but we are using the first frame's matrix for all frames since they do not
                 #  change significantly unless the operating table is moved
@@ -428,9 +463,12 @@ class SceneOptimizer():
                 # Setup for training
                 self.net.training_setup(self.cfg['training'])
                 # Fit first frame
-                self.fit(frame, iters=self.cfg['training']['iters_first'], incremental=False)
+                self.fit(frame, iters=self.cfg['training']['iters_first'], deform=self.deform)
             else:
-                self.fit(frame, iters=self.cfg['training']['iters'], incremental=False)
+                # Visualize what the first render looks like, before any fitting but with the potentially new style
+                with torch.no_grad():
+                    _, _ = self.visualizer.save_imgs(iters, gt_depth, gt_color, gt_c2w, self.scale, first_render_debug=True)
+                self.fit(frame, iters=self.cfg['training']['iters'], deform=self.deform)
 
             # eval
             with torch.no_grad():
@@ -453,10 +491,10 @@ class SceneOptimizer():
                         # We have to go back to the original mesh/CT space; the registration was applied in the Gaussian model, have to go back
                         undo_register_mesh(slicer_deformed_mesh, registration)
                         undo_preprocess_mesh(slicer_deformed_mesh, self.cfg['dataset'])
-                        pv.save_meshio(f'{self.output}/deformed_mesh_{ids.item()}.obj', slicer_deformed_mesh)
+                        pv.save_meshio(f'{self.output}/deformed_mesh_{iters}.obj', slicer_deformed_mesh)
 
                     # General visualization of the current iteration
-                    _, _ = self.visualizer.save_imgs(ids.item(), gt_depth, gt_color,
+                    _, _ = self.visualizer.save_imgs(iters, gt_depth, gt_color,
                                                                         gt_c2w, self.scale, mesh=mesh_copy,
                                                                         registration=registration, deformed_mesh=deformed_mesh)
                     # # Visualization of the deformations in particular
@@ -532,6 +570,13 @@ class SceneOptimizer():
                     if max_l2_error > global_max_error:
                         global_max_error = max_l2_error
 
+            # Switch dataset if needed
+            if self.hypernet_training:
+                if iters % self.iters_per_style == 0:
+                    new_dataset_id = random.randint(0, len(self.frame_reader.datasets)-1)
+                    self.frame_reader.switch_dataset(new_dataset_id)
+                    print(f"Switching to dataset {new_dataset_id}")
+
         if self.eval:
             print(f"Global metrics over all frames:")
             print(f'Mean L2 error: {np.mean(mesh_error_l2)}')
@@ -572,7 +617,7 @@ if __name__ == "__main__":
     trainer.run()
     print("Training finished")
 
-    # Estimate pose for the first frame
-    print("Start pose estimation...")
-    trainer.estimate_pose(cfg['data']['target_image'], max_iter=500, camera_idx=67)
-    print("Pose estimation finished")
+    # # Estimate pose for the first frame
+    # print("Start pose estimation...")
+    # trainer.estimate_pose(cfg['data']['target_image'], max_iter=500, camera_idx=67)
+    # print("Pose estimation finished")

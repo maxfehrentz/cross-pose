@@ -36,6 +36,7 @@ training:
   grad_weighing: False # default: True
 
 model:
+  deform: False
   deform_network:
     subsample: 8 # default: 32
     k: 15 # default: 25

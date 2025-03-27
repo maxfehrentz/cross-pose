@@ -21,6 +21,7 @@ cam:
   point_src_light_model: True
 
 training:
+  hypernet_training: False
   spherical_harmonics: True
   optical_flow_init: True
   grad_weighing: True
@@ -58,6 +59,7 @@ training:
 model:
   visit_alpha: 0.1
   visit_offset: 100
+  deform: True
   deform_network: # Deform network
     model: sparse
     subsample: 64

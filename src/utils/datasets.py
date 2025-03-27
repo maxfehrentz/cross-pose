@@ -9,7 +9,22 @@ from scipy.spatial.transform import Rotation
 from scipy.ndimage import binary_erosion
 from src.utils.semantic_utils import SemanticDecoder
 from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES, FLIP_CAM_AXES
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
+
+@dataclass
+class FrameData:
+    ids: torch.Tensor
+    gt_color: torch.Tensor
+    gt_color_r: Optional[torch.Tensor]
+    gt_c2w: torch.Tensor
+    registration: Optional[torch.Tensor]
+    tool_mask: Optional[torch.Tensor]
+    semantics: Optional[torch.Tensor]
+    intrinsics: Optional[torch.Tensor]
+    gt_mesh_path: Optional[str]
+    style_img_path: Optional[str] = None
 
 # Currently one class for ATLAS (clinical) and SOFA (simulated)
 class MonoMeshMIS(Dataset):
@@ -105,7 +120,18 @@ class MonoMeshMIS(Dataset):
         registration_matrix = self.registration_matrices[index]
         intrinsics = self.intrinsics[index]
         gt_mesh_path = self.gt_mesh_paths[index]
-        return index, color_data, None, pose, registration_matrix, mask_data, semantics, intrinsics, gt_mesh_path
+
+        return FrameData(
+            ids=index,
+            gt_color=color_data,
+            gt_color_r=None,
+            gt_c2w=pose,
+            registration=registration_matrix,
+            tool_mask=mask_data,
+            semantics=semantics,
+            intrinsics=intrinsics,
+            gt_mesh_path=gt_mesh_path
+        )
     
     def __len__(self):
         return len(self.poses)
@@ -113,13 +139,13 @@ class MonoMeshMIS(Dataset):
 
 # TODO: a bit misleading, also for MonoMeshMIS, that we are loading the mesh separately somewhere else
 class Neuro(Dataset):
-    def __init__(self, cfg, args, scale):
+    def __init__(self, cfg, args, scale, name=None, input_folder=None, transforms_path=None):
         super(Neuro, self).__init__()
-        self.name = cfg['dataset']
+        self.name = name if name is not None else cfg['dataset']
 
         self.scale = scale
-        self.input_folder = cfg['data']['image_input_folder']
-        self.transforms_path = cfg['data']['transforms']
+        self.input_folder = input_folder if input_folder is not None else cfg['data']['image_input_folder']
+        self.transforms_path = transforms_path if transforms_path is not None else cfg['data']['transforms']
 
         # Load cameras and image and mask paths
         self.poses, self.intrinsics, self.image_paths, self.registration_matrix = self.load_cams_and_filepaths(self.transforms_path)
@@ -167,19 +193,64 @@ class Neuro(Dataset):
         pose = self.poses[index]
         registration_matrix = self.registration_matrix
         intrinsics = self.intrinsics
-        return index, image_data, pose, registration_matrix, intrinsics
+
+        return FrameData(
+            ids=index,
+            gt_color=image_data,
+            gt_color_r=None,
+            gt_c2w=pose,
+            registration=registration_matrix,
+            tool_mask=None,
+            semantics=None,
+            intrinsics=intrinsics,
+            gt_mesh_path=None
+        )
     
     def __len__(self):
         return len(self.poses)
 
 
-class NeuroWrapper(Neuro):
+class HyperNeuro(Dataset):
     def __init__(self, cfg, args, scale):
-        super(NeuroWrapper, self).__init__(cfg, args, scale)
+        super(HyperNeuro, self).__init__()
+        self.name = cfg['dataset']
+
+        self.scale = scale
+        self.base_folder = cfg['data']['base_folder']
+        self.image_foldername = cfg['data']['image_input_folder']
+        self.transforms_filename = cfg['data']['transforms']
+        self.style_folder = os.path.join(self.base_folder, cfg['data']['style_folder'])
+
+        self.datasets = []
+        self.styles = []
+
+        self.current_dataset = 0
+
+        # TODO: this might cause issues later when we have a larger dataset, but for now load everything into memory
+        for dataset_folder in os.listdir(self.base_folder):
+            dataset_folder_path = os.path.join(self.base_folder, dataset_folder)
+            if os.path.isdir(dataset_folder_path):
+                input_folder = os.path.join(dataset_folder_path, self.image_foldername)
+                transforms_path = os.path.join(dataset_folder_path, self.transforms_filename)
+                print(f"input folder: {input_folder}")
+                print(f"transforms path: {transforms_path}")
+                self.datasets.append(Neuro(None, None, scale, name='NEURO', input_folder=input_folder, transforms_path=transforms_path))
+                style_filename = dataset_folder + '.png'
+                print(f"style filename: {style_filename}")
+                self.styles.append(os.path.join(self.style_folder, style_filename))
+
+    def switch_dataset(self, index):
+        self.current_dataset = index
 
     def __getitem__(self, index):
-        _, image_data, pose, registration_matrix, intrinsics = super().__getitem__(index)
-        return index, image_data, None, pose, registration_matrix, None, None, intrinsics, None
+        # debug print compatible with tqdm
+        print(f"pulling frame {index} from dataset {self.current_dataset} belonging to style {self.styles[self.current_dataset]}")
+        frame_data = self.datasets[self.current_dataset].__getitem__(index)
+        frame_data.style_img_path = self.styles[self.current_dataset]
+        return frame_data
+
+    def __len__(self):
+        return len(self.datasets[self.current_dataset])
 
 
 class StereoMIS(Dataset):
@@ -255,5 +326,37 @@ class StereoMIS(Dataset):
 # extend default collate for None elements
 def collate_none_fn(batch, *, collate_fn_map = None):
     return None
+
+# New collate function for FrameData
+def collate_framedata_fn(batch, *, collate_fn_map = None):
+    return FrameData(
+        ids=default_collate_fn_map[type(batch[0].ids)](
+            [item.ids for item in batch], collate_fn_map=collate_fn_map),
+        gt_color=default_collate_fn_map[torch.Tensor](
+            [item.gt_color for item in batch], collate_fn_map=collate_fn_map),
+        gt_color_r=default_collate_fn_map[type(batch[0].gt_color_r)](
+            [item.gt_color_r for item in batch], collate_fn_map=collate_fn_map),
+        gt_c2w=default_collate_fn_map[torch.Tensor](
+            [item.gt_c2w for item in batch], collate_fn_map=collate_fn_map),
+        registration=default_collate_fn_map[type(batch[0].registration)](
+            [item.registration for item in batch], collate_fn_map=collate_fn_map),
+        tool_mask=default_collate_fn_map[type(batch[0].tool_mask)](
+            [item.tool_mask for item in batch], collate_fn_map=collate_fn_map),
+        semantics=default_collate_fn_map[type(batch[0].semantics)](
+            [item.semantics for item in batch], collate_fn_map=collate_fn_map),
+        intrinsics=default_collate_fn_map[type(batch[0].intrinsics)](
+            [item.intrinsics for item in batch], collate_fn_map=collate_fn_map),
+        gt_mesh_path=default_collate_fn_map[type(batch[0].gt_mesh_path)](
+            [item.gt_mesh_path for item in batch], collate_fn_map=collate_fn_map),
+        style_img_path=default_collate_fn_map[type(batch[0].style_img_path)](
+            [item.style_img_path for item in batch], collate_fn_map=collate_fn_map)
+    )
+
+# Update the default collate map with both functions
 from torch.utils.data._utils.collate import default_collate_fn_map
-default_collate_fn_map.update({type(None):collate_none_fn})
+# default_collate_fn_map.update({type(None):collate_none_fn})
+default_collate_fn_map.update({
+    type(None): collate_none_fn,
+    FrameData: collate_framedata_fn
+})
+

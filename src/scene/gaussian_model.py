@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torchvision
 import numpy as np
 from src.utils.sh_utils import RGB2SH
 from src.utils.mesh_utils import register_mesh
@@ -1076,25 +1077,47 @@ class HyperMeshAwareGaussianModel(nn.Module):
         super().__init__()
         self.hypernet_cfg = hypernet_cfg
         self.model = MeshAwareGaussianModel(cfg)
+        self.style_img_path = None
 
     def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0):
         self.model.create_from_mesh(mesh, registration, depth, spatial_lr_scale)
         self.model = hl.hypernetize(self.model, parameters=[self.model._features_dc, self.model._features_rest])
         params_shape = self.model.external_shapes()
         # TODO: will later have to make sure this is identical to architecture from previous paper
+        # TODO: hardcoded input, need to change later
         self.hypernet = hl.HyperNet(
-            input_shapes={'h': (256,)},
+            input_shapes={'h': (96,)},
             output_shapes=params_shape,
-            hidden_sizes=[16, 64, 128],).to("cuda")
+            hidden_sizes=[32],).to("cuda")
+
+    def set_style_img_path(self, style_img_path):
+        self.style_img_path = style_img_path
+
+    def get_hist(self, img_path):
+        # Load the image directly into a tensor
+        image_tensor = torchvision.io.read_image(img_path).float() / 255.0
+        # Define the number of bins and range
+        num_bins = 32
+        # Image tensors are normalized, so range is [0, 1]
+        min_range = 0
+        max_range = 1
+        # Initialize the histogram tensor
+        hist_tensor = torch.zeros((3, num_bins))
+        # Calculate the histogram for each channel
+        for i in range(3):
+            hist = torch.histc(image_tensor[i], bins=num_bins, min=min_range, max=max_range)
+            hist = hist / hist.sum()  # Normalize the histogram
+            hist_tensor[i] = hist
+        # Flatten the histogram to use as input to neural network
+        hist_flattened = hist_tensor.view(1, -1)
+        return hist_flattened
 
     def forward(self, deform=False):
-        # Get new params from hypernet
-        # TODO: using dummy data for now, change later
-        vector = torch.ones((256,)).to("cuda")
-        new_params = self.hypernet(h=vector)
+        style_features = self.get_hist(self.style_img_path).cuda()
+        new_params = self.hypernet(h=style_features)
         with self.model.using_externals(new_params):
             return self.model.forward(deform)
-
+        
     def compute_regularization(self, visibility_filter):
         return self.model.compute_regularization(visibility_filter)
     
@@ -1129,10 +1152,10 @@ class HyperMeshAwareGaussianModel(nn.Module):
             # {'params': self.model.mesh_deformation.parameters(), 'lr': training_args["deformation_lr_init"], "name": "deformation"},
             {'params': [self.model._opacity], 'lr': training_args["opacity_lr"], "name": "opacity"},
             {'params': [self.model._scaling], 'lr': training_args["scaling_lr"], "name": "scaling"},
-            # TODO: deal with this later, will need a proper config for the hypernet to determine lr and also architecture
-            {'params': self.hypernet.parameters(), 'lr': 0.001, "name": "hypernet"},
+            {'params': self.hypernet.parameters(), 'lr': float(training_args["hypernet"]["lr"]), "name": "hypernet"},
         ]
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # TODO: should create a scheduler here
 
     def enable_spherical_harmonics(self):
         self.model.enable_spherical_harmonics()

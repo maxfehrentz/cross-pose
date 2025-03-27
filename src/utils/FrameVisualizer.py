@@ -41,7 +41,7 @@ class FrameVisualizer(object):
         self.net = net
         self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    def save_imgs(self, idx, gt_depth, gt_color, c2w, scale, mesh=None, registration=None, deformed_mesh=None):
+    def save_imgs(self, idx, gt_depth, gt_color, c2w, scale, mesh=None, registration=None, deformed_mesh=None, first_render_debug=False):
         """
         Visualization of depth and color images and save to file.
         Args:
@@ -49,6 +49,15 @@ class FrameVisualizer(object):
         """
         self.camera.set_c2w(c2w)
         render_pkg = render(self.camera, self.net, self.background, scale, mesh=mesh, registration=registration, deform=False, deformed_mesh=deformed_mesh)
+
+        if first_render_debug:
+            splatted_image = render_pkg['render'].cpu().numpy()
+            splatted_image = np.clip(splatted_image, 0, 1)
+            splat_plot = self.plot_splat(c2w, splatted_image)
+            splat_filename = f'{idx:05d}_first_render.jpg'
+            outsplat = os.path.join(self.outsplat, splat_filename)
+            imsave(outsplat, splat_plot)
+            return None, None
 
         # renderer for pose estimation does not support depth
         # splat_depth = render_pkg['depth']
