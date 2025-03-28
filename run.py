@@ -2,44 +2,32 @@ import numpy as np
 import os
 import torch
 import torchvision
-import wandb
-from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
-from scipy.spatial import KDTree
 from tqdm import tqdm
 from argparse import ArgumentParser
-import pickle
 from torch.utils.data import DataLoader
 from src.utils.CT_reader import read_ct_volume
 from src.utils.camera import Camera
 from src.utils.FrameVisualizer import FrameVisualizer
-from src.utils.flow_utils import get_depth_from_raft
 from src.utils.datasets import MonoMeshMIS, Neuro, HyperNeuro
 from src.utils.loss_utils import l1_loss, VGGPerceptualLoss, GaussianAppearanceRegularizer
 from src.utils.renderer import render
 from src.scene.gaussian_model import MeshAwareGaussianModel, HyperMeshAwareGaussianModel
 from src.utils.mesh_utils import preprocess_mesh, undo_preprocess_mesh, undo_register_mesh
 from src.utils.transform_utils import SWAP_AND_FLIP_WORLD_AXES
-
 # For Depth Anything V2
 import cv2
 import sys
 sys.path.append('Depth-Anything-V2')
 from depth_anything_v2.dpt import DepthAnythingV2
-
 # For the preoperative CT
 import pyvista as pv
-
 # For benchmarking
 from torch.profiler import profile, record_function, ProfilerActivity
-
 # Initialize tensorboard writer
 from torch.utils.tensorboard import SummaryWriter
-
-# For VTK
-import vtk
-
 # For pose estimation
 from src.scene.camera_pose import CameraPose
+
 
 class SceneOptimizer():
     def __init__(self, cfg, args):
@@ -59,7 +47,11 @@ class SceneOptimizer():
         elif self.cfg['dataset'] == 'NEURO':
             self.frame_reader = Neuro(cfg, args, scale=self.scale)
         elif self.cfg['dataset'] == 'HYPERNEURO':
-            self.frame_reader = HyperNeuro(cfg, args, scale=self.scale)
+            self.frame_reader = HyperNeuro(cfg, args, scale=self.scale, mode='train')
+            if self.cfg['training']['val']:
+                self.frame_reader_val = HyperNeuro(cfg, args, scale=self.scale, mode='val')
+            else:
+                self.frame_reader_val = None
         else:
             raise ValueError(f"Dataset {self.cfg['dataset']} not supported")
         
@@ -76,26 +68,15 @@ class SceneOptimizer():
         # TODO: set num_workers to 0 to prevent prefetching data and force actual switching between datasets
         #  find better way to do this
         self.frame_loader = DataLoader(self.frame_reader, batch_size=1, num_workers=0, shuffle=shuffle)
+        if self.frame_reader_val is not None:
+            self.frame_loader_val = DataLoader(self.frame_reader_val, batch_size=1, num_workers=0, shuffle=False)
 
         self.camera = Camera(cfg['cam'])
+        self.visualizer = FrameVisualizer(self.output, cfg, self.net)
+        self.background = torch.tensor([0,0,0], dtype=torch.float32, device="cuda")
+
         if self.cfg['model']['ARAP']['active']:
             self.output = f"{self.output}_ARAP"
-        self.visualizer = FrameVisualizer(self.output, cfg, self.net)
-
-        self.log_freq = args.log_freq
-        self.log = args.log is not None
-        self.run_id = wandb.util.generate_id()
-        log_cfg = cfg.copy()
-        log_cfg.update(vars(args))
-        if self.log:
-            wandb.init(id=self.run_id, name=args.log, config=log_cfg, project='gtracker', group=args.log_group)
-        self.background = torch.tensor([0,0,0], dtype=torch.float32, device="cuda")
-        self.dbg = args.debug
-
-        # Checking for baseline, not available if monocular dataset
-        self.baseline = cfg['cam'].get('stereo_baseline', None)
-        if self.baseline is not None:
-            self.baseline = self.baseline / 1000.0 * self.scale
 
         # Checking for mesh
         self.mesh = cfg.get('data', {}).get('mesh', None)
@@ -104,17 +85,6 @@ class SceneOptimizer():
             self.mesh = pv.read(self.mesh)
             # Preprocesses mesh in place; dataset is relevant as different datasets have different mesh coordinate system conventions
             preprocess_mesh(self.mesh, dataset=self.cfg['dataset'])
-
-        # Initialize Depth Anything V2 model
-        model_configs = {
-            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-        }
-        encoder = 'vitl'
-        self.depth_anything = DepthAnythingV2(**model_configs[encoder])
-        self.depth_anything.load_state_dict(torch.load(f'Depth-Anything-V2/checkpoints/depth_anything_v2_{encoder}.pth', map_location='cpu'))
-        self.depth_anything = self.depth_anything.to(self.device).eval()
 
         # Initialize tensorboard writer
         self.writer = SummaryWriter(os.path.join(self.output, 'tensorboard'))
@@ -249,8 +219,38 @@ class SceneOptimizer():
 
             # Save the original rendered image as well
             cv2.imwrite(f"{self.output}/pose_estimation_original_{i}.png", rendered_img_vis)
+    
+    def val(self, deform):
+        self.net.eval()
+        with torch.no_grad():
+            total_loss = 0
+            n = 0
+            for frame_data in self.frame_loader_val:
+                # Prepare data
+                gt_color = frame_data.gt_color.cuda()
+                gt_c2w = frame_data.gt_c2w.cuda()
+                tool_mask = frame_data.tool_mask.cuda() if frame_data.tool_mask is not None else None
+                intrinsics = frame_data.intrinsics
+                style_img_path = frame_data.style_img_path
 
+                # Prepare hypernet
+                if self.hypernet_training and style_img_path is not None:
+                    # Has become a list through collate function in DataLoader
+                    self.net.set_style_img_path(style_img_path[0])
 
+                # Setup camera
+                if intrinsics is not None:
+                    intrinsics = torch.squeeze(intrinsics)
+                    self.camera.set_intrinsics(fx=intrinsics[0], fy=intrinsics[1], cx=intrinsics[2], cy=intrinsics[3])
+                self.camera.set_c2w(gt_c2w)
+
+                render_pkg = render(self.camera, self.net, self.background, self.scale, deform=deform)
+                # TODO: would also want a proper visualization here, completely stupid that we have to render in the frame visualizer, change that
+                color = render_pkg['render'][None, ...]
+                total_loss += self.cfg['training']['w_color']*l1_loss(color[tool_mask], gt_color[tool_mask])
+                n += 1
+            return total_loss / n
+        
     # TODO: don't like how we pass deform here despite it being an attribute anyways; also weird to call it in render, would be better
     #  to have it as a parameter of the model (here called net) and put the logic in there
     # TODO: when using an attribute to control whether deformation happens, we should also not require ARAP config, the def. network etc.
@@ -402,27 +402,11 @@ class SceneOptimizer():
             gt_c2w = gt_c2w.cuda()
             tool_mask = tool_mask.cuda() if tool_mask is not None else None
             semantics = semantics.float().cuda() if semantics is not None else None
-            with torch.no_grad():
-                # Check if stereo is available
-                if gt_color_r is not None:
-                    gt_depth, flow_valid = get_depth_from_raft(self.raft, gt_color, gt_color_r, self.baseline)
-                else:
-                    # Reversing preprocessing
-                    raw_gt_color = gt_color.squeeze().cpu().numpy() * 255
-                    raw_gt_color = raw_gt_color.astype(np.uint8)
-                    raw_gt_color = cv2.cvtColor(raw_gt_color, cv2.COLOR_RGB2BGR)
 
-                    # Use Depth Anything V2 to infer depth on monocular datasets; requires raw image data as np array
-                    input_size_depth = 512
-
-                    # Getting to relative depth
-                    gt_disparity = self.depth_anything.infer_image(raw_gt_color, input_size=input_size_depth)
-                    gt_disparity = torch.from_numpy(gt_disparity).cuda().unsqueeze(0)
-                    gt_depth = 1 / gt_disparity
-
-                    # Compute relative depth
-                    gt_depth = gt_depth / gt_depth.max()
-
+            # TODO: remove all the depth related stuff later, will not use this
+            gt_depth = torch.ones_like(gt_color, dtype=torch.float32).cuda()
+            gt_depth -= 0.01
+            
             frame = ids, gt_color, gt_depth, gt_c2w, tool_mask
 
             # Set cam intrinsics if available
@@ -434,7 +418,8 @@ class SceneOptimizer():
                 # Note that we are using the matrix coming from the first frame; some datasets provide a registration
                 #  matrix for each frame, but we are using the first frame's matrix for all frames since they do not
                 #  change significantly unless the operating table is moved
-                self.net.create_from_mesh(self.mesh.copy(), registration, gt_depth, self.scale)
+                # TODO: if relevant, make gaussians per triangle part of the config
+                self.net.create_from_mesh(self.mesh.copy(), registration, gt_depth, self.scale, gaussians_per_triangle=25)
 
                 # Render once to check for visibility filter and initialize the deformation field based on that
                 with torch.no_grad():
@@ -569,6 +554,12 @@ class SceneOptimizer():
                     mesh_error_std.append(std_l2_error)
                     if max_l2_error > global_max_error:
                         global_max_error = max_l2_error
+
+            if self.cfg['training']['val']:
+                if iters % self.cfg['training']['val_params']['val_freq'] == 0:
+                    avg_loss = self.val(deform=self.deform)
+                    print(f"Average loss: {avg_loss}")
+                    self.writer.add_scalar('ValLoss/Photometric', avg_loss, iters)
 
             # Switch dataset if needed
             if self.hypernet_training:

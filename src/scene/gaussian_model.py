@@ -1079,16 +1079,24 @@ class HyperMeshAwareGaussianModel(nn.Module):
         self.model = MeshAwareGaussianModel(cfg)
         self.style_img_path = None
 
-    def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0):
-        self.model.create_from_mesh(mesh, registration, depth, spatial_lr_scale)
-        self.model = hl.hypernetize(self.model, parameters=[self.model._features_dc, self.model._features_rest])
+    def create_from_mesh(self, mesh, registration, depth, spatial_lr_scale=1.0, gaussians_per_triangle=25):
+        self.model.create_from_mesh(mesh, registration, depth, spatial_lr_scale, gaussians_per_triangle)
+
+        # Overwrite the higher bands of the spherical harmonics, just set them to 0, not optimizing for them for now
+        self.model._features_rest = nn.Parameter(
+            torch.zeros_like(self.model._features_rest), 
+            requires_grad=False)
+        # Only optimizing for albedo
+        self.model = hl.hypernetize(self.model, parameters=[self.model._features_dc])
         params_shape = self.model.external_shapes()
+        print(f"Params shape: {params_shape}")
+
         # TODO: will later have to make sure this is identical to architecture from previous paper
         # TODO: hardcoded input, need to change later
         self.hypernet = hl.HyperNet(
             input_shapes={'h': (96,)},
             output_shapes=params_shape,
-            hidden_sizes=[32],).to("cuda")
+            hidden_sizes=[32, 32, 32, 32]).to("cuda")
 
     def set_style_img_path(self, style_img_path):
         self.style_img_path = style_img_path
@@ -1152,7 +1160,7 @@ class HyperMeshAwareGaussianModel(nn.Module):
             # {'params': self.model.mesh_deformation.parameters(), 'lr': training_args["deformation_lr_init"], "name": "deformation"},
             {'params': [self.model._opacity], 'lr': training_args["opacity_lr"], "name": "opacity"},
             {'params': [self.model._scaling], 'lr': training_args["scaling_lr"], "name": "scaling"},
-            {'params': self.hypernet.parameters(), 'lr': float(training_args["hypernet"]["lr"]), "name": "hypernet"},
+            {'params': self.hypernet.parameters(), 'lr': training_args["hypernet"]["lr"], "name": "hypernet"},
         ]
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         # TODO: should create a scheduler here

@@ -211,9 +211,10 @@ class Neuro(Dataset):
 
 
 class HyperNeuro(Dataset):
-    def __init__(self, cfg, args, scale):
+    def __init__(self, cfg, args, scale, mode):
         super(HyperNeuro, self).__init__()
         self.name = cfg['dataset']
+        self.mode = mode
 
         self.scale = scale
         self.base_folder = cfg['data']['base_folder']
@@ -226,25 +227,38 @@ class HyperNeuro(Dataset):
 
         self.current_dataset = 0
 
-        # TODO: this might cause issues later when we have a larger dataset, but for now load everything into memory
+        assert self.mode in ['train', 'val', 'test'], "Mode must be either 'train', 'val', or 'test'"
+
+        val_name = cfg['data']['val']
+        test_name = cfg['data']['test']
+        exclude_name = cfg['data']['exclude']
         for dataset_folder in os.listdir(self.base_folder):
+            val_folder = val_name in dataset_folder
+            test_folder = test_name in dataset_folder
+            exclude_folder = exclude_name in dataset_folder
+            if exclude_folder:
+                print(f"Excluding dataset {dataset_folder} because it contains {exclude_name}")
+                continue
+            if self.mode == 'val' and not val_folder or self.mode == 'test' and not test_folder:
+                continue
+            if self.mode == 'train' and (val_folder or test_folder):
+                continue
             dataset_folder_path = os.path.join(self.base_folder, dataset_folder)
             if os.path.isdir(dataset_folder_path):
                 input_folder = os.path.join(dataset_folder_path, self.image_foldername)
                 transforms_path = os.path.join(dataset_folder_path, self.transforms_filename)
-                print(f"input folder: {input_folder}")
-                print(f"transforms path: {transforms_path}")
                 self.datasets.append(Neuro(None, None, scale, name='NEURO', input_folder=input_folder, transforms_path=transforms_path))
                 style_filename = dataset_folder + '.png'
-                print(f"style filename: {style_filename}")
                 self.styles.append(os.path.join(self.style_folder, style_filename))
+
+        print(f"Loaded {len(self.datasets)} datasets for mode {self.mode}")       
 
     def switch_dataset(self, index):
         self.current_dataset = index
 
     def __getitem__(self, index):
         # debug print compatible with tqdm
-        print(f"pulling frame {index} from dataset {self.current_dataset} belonging to style {self.styles[self.current_dataset]}")
+        print(f"mode: {self.mode}, frame {index}, datasetindex: {self.current_dataset}, style {self.styles[self.current_dataset]}")
         frame_data = self.datasets[self.current_dataset].__getitem__(index)
         frame_data.style_img_path = self.styles[self.current_dataset]
         return frame_data

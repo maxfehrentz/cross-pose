@@ -22,6 +22,7 @@ cam:
 
 training:
   hypernet_training: False
+  val: False
   spherical_harmonics: True
   optical_flow_init: True
   grad_weighing: True

@@ -10,10 +10,13 @@ cam:
   cy: 256
 
 training:
+  val: True
+  val_params:
+    val_freq: 10
   hypernet_training: True
   hypernet:
     iters_per_style: 5
-    lr: 1e-2
+    lr: 0.01
     eps: 1e-15
     max_iterations: 50000
     exp_decay_scheduler_final: 0.0001
